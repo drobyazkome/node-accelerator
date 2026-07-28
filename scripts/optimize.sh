@@ -142,12 +142,12 @@ setup_xanmod_repo() {
     # фоллбэк на bookworm падал так же, и ядро молча не ставилось «репо недоступен».
     local -a UPDSC=(-o "Dir::Etc::sourcelist=$list" -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0)
     echo "deb [signed-by=$keyring] https://deb.xanmod.org $codename main" > "$list"
-    if ! apt-get update -qq "${UPDSC[@]}" 2>/dev/null; then
+    if ! apt-get -o DPkg::Lock::Timeout=300 update -qq "${UPDSC[@]}" 2>/dev/null; then
         if [[ "$codename" != "bookworm" ]]; then
             warn "Suite '$codename' не поднялся — откатываюсь на 'bookworm' (LTS)"
             codename="bookworm"; XANMOD_FLAVOR="lts"
             echo "deb [signed-by=$keyring] https://deb.xanmod.org $codename main" > "$list"
-            apt-get update -qq "${UPDSC[@]}" 2>/dev/null || { warn "XanMod-репо недоступен"; rm -f "$list"; return 1; }
+            apt-get -o DPkg::Lock::Timeout=300 update -qq "${UPDSC[@]}" 2>/dev/null || { warn "XanMod-репо недоступен"; rm -f "$list"; return 1; }
         else
             warn "XanMod-репо ('bookworm') недоступен"; rm -f "$list"; return 1
         fi
@@ -185,7 +185,7 @@ install_xanmod() {
         # APT::Status-Fd=1 → машинный прогресс в stdout; stdbuf -oL снимает буферизацию пайпа.
         # pkg НЕ трогаем в subshell справа от пайпа (там только отрисовка) — ставим в родителе.
         if DEBIAN_FRONTEND=noninteractive stdbuf -oL \
-                apt-get -o APT::Status-Fd=1 install -y "$p" 2>"$err_log" \
+                apt-get -o APT::Status-Fd=1 -o DPkg::Lock::Timeout=300 install -y "$p" 2>"$err_log" \
                 | while IFS=: read -r f1 f2 f3 f4 _r; do
                     case "$f1" in
                         pmstatus|dlstatus)
@@ -227,7 +227,7 @@ if [[ "${XANMOD_PROBE:-0}" == "1" ]]; then
     for p in $cand; do
         if apt-cache show "$p" >/dev/null 2>&1; then
             ok "XANMOD_PROBE: '$p' доступен в репозитории"
-            DEBIAN_FRONTEND=noninteractive apt-get install --download-only -y "$p" >/dev/null 2>&1 \
+            DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install --download-only -y "$p" >/dev/null 2>&1 \
                 && ok "XANMOD_PROBE: '$p' скачивается" \
                 || warn "XANMOD_PROBE: '$p' в индексе есть, но download-only не прошёл (зависимости дистрибутива)"
             exit 0

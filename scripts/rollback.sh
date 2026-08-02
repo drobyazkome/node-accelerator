@@ -82,7 +82,7 @@ rollback_protect() {
     rm -f "$STATE_DIR/na-fw-safety.pid" "$STATE_DIR/na-fw-safety.log" /tmp/na-fw-safety.pid /tmp/na-fw-safety.log 2>/dev/null || true
 
     # v3.0 модули: fleet-sync / blocklists / ctguard — снимаем таймеры/сервисы
-    for unit in na-firewall na-fleet-sync na-blocklist na-ctguard; do
+    for unit in na-firewall na-fleet-sync na-blocklist na-scanner na-ctguard; do
         systemctl disable --now "$unit.service" >/dev/null 2>&1 || true
         systemctl disable --now "$unit.timer"   >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/$unit.service" "/etc/systemd/system/$unit.timer"
@@ -94,7 +94,7 @@ rollback_protect() {
     nft delete table inet na_ctguard 2>/dev/null || true
     rm -f "$CONF_DIR/na_filter.nft"
     rm -f /usr/local/sbin/na-fw-status /usr/local/sbin/na-fw-top-talkers \
-          /usr/local/sbin/na-fleet-sync /usr/local/sbin/na-blocklist-update /usr/local/sbin/na-ctguard \
+          /usr/local/sbin/na-fleet-sync /usr/local/sbin/na-blocklist-update /usr/local/sbin/na-scanner-update /usr/local/sbin/na-ctguard \
           /usr/local/sbin/na-fw-safety-revert
     rm -f "$STATE_DIR/safety-fired.last" "$STATE_DIR/protect.lock"
     # nftables.service мы включали (boot-persist), но выключать не будем: он лишь грузит
@@ -103,8 +103,9 @@ rollback_protect() {
     rm -f /etc/modules-load.d/na-synproxy.conf "$STATE_DIR/.synproxy-degraded"
     # конфиги: persisted protect.conf, ctguard.conf, токен панели fleet.env (custom-blocklist.txt — данные оператора, оставляем)
     rm -f "$STATE_DIR/protect.installed" "$CONF_DIR/protect.conf" "$CONF_DIR/ctguard.conf" "$CONF_DIR/fleet.env"
-    rm -f "$STATE_DIR/fleet-sync.last" "$STATE_DIR/blocklist.last"
+    rm -f "$STATE_DIR/fleet-sync.last" "$STATE_DIR/blocklist.last" "$STATE_DIR/scanner.last"
     [[ -f "$CONF_DIR/custom-blocklist.txt" ]] && info "оставлен $CONF_DIR/custom-blocklist.txt (данные оператора)"
+    [[ -f "$CONF_DIR/scanner-asns.txt" ]] && info "оставлен $CONF_DIR/scanner-asns.txt (данные оператора)"
     ok "na_filter/na_ctguard удалены, сервисы и таймеры сняты"
 
     if [[ "${NA_PURGE_CROWDSEC:-0}" == "1" ]]; then

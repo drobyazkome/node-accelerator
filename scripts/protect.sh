@@ -124,6 +124,23 @@ NODE_PORT_PEERS="${NODE_PORT_PEERS:-}"   # персист авто-подхва�
 ENABLE_BLOCKLISTS="${ENABLE_BLOCKLISTS:-0}"
 BLOCK_TOR="${BLOCK_TOR:-0}"
 BLOCKLIST_REFRESH="${BLOCKLIST_REFRESH:-12h}"
+# Масс-сканеры (Censys/Driftnet/ONYPHE/Shodan/Stretchoid и прочие индексаторы) — opt-in.
+# Два источника, СОЗНАТЕЛЬНО разной природы:
+#   1) ASN-лист — только организации, ЧЬЁ ЕДИНСТВЕННОЕ ЗАНЯТИЕ сканирование. Префиксы
+#      резолвятся по RIPEstat (HTTPS) с фолбэком на whois RADB (TCP/43 режут у части
+#      хостеров). Крупные облака сюда попадать НЕ ДОЛЖНЫ: сканер, арендовавший /24 в
+#      GCP, не повод дропнуть 3457 префиксов Google.
+#   2) Префикс-фиды — точечные диапазоны сканеров, живущих ВНУТРИ больших облаков
+#      (Linode/Azure/DO/GCP). Их можно резать только по префиксу, не по ASN.
+# Предохранитель от «ASN оказался облаком»: SCANNER_ASN_MAX_PREFIXES.
+ENABLE_SCANNERS="${ENABLE_SCANNERS:-0}"
+SCANNER_REFRESH="${SCANNER_REFRESH:-7d}"
+SCANNER_ASN_SOURCE="${SCANNER_ASN_SOURCE:-auto}"      # auto|ripestat|whois
+SCANNER_ASN_MAX_PREFIXES="${SCANNER_ASN_MAX_PREFIXES:-96}"  # ASN шире — пропустить целиком
+SCANNER_MIN_PREFIXLEN="${SCANNER_MIN_PREFIXLEN:-16}"  # префикс короче /16 — отбросить
+SCANNER_FEEDS="${SCANNER_FEEDS:-1}"                   # 1 = тянуть и префикс-фиды тоже
+RIPESTAT_TIMEOUT="${RIPESTAT_TIMEOUT:-15}"
+WHOIS_TIMEOUT="${WHOIS_TIMEOUT:-20}"
 # Remnawave fleet auto-sync: ноды флота сами держат IP друг друга в whitelist.
 # 'auto' = вкл при заданных REMNAWAVE_URL+TOKEN (или REMNAWAVE_NODES_URL); 1=форс; 0=выкл.
 # REMNAWAVE_NODES_URL — альтернатива БЕЗ токена панели на ноде: статический JSON того же
@@ -220,14 +237,20 @@ done
 for _k in SSH_BAN_TIME PORTSCAN_BAN_TIME SUSPECT_TIME NA_CTG_BANTIME; do
     _is_duration "${!_k}" || { err "$_k='${!_k}' — ожидается число с опц. суффиксом s|m|h|d"; exit 1; }
 done
-for _k in BLOCKLIST_REFRESH FLEET_SYNC_INTERVAL NA_CTG_INTERVAL; do
+for _k in BLOCKLIST_REFRESH FLEET_SYNC_INTERVAL NA_CTG_INTERVAL SCANNER_REFRESH; do
     _is_systime "${!_k}" || { err "$_k='${!_k}' — ожидается systemd-интервал (напр. 12h, 5min)"; exit 1; }
 done
 # enum-флаги 0/1 (+auto где уместно)
 for _k in ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC ENABLE_SYNPROXY ENABLE_BANONCE \
-          ENABLE_BLOCKLISTS BLOCK_TOR ENABLE_CTGUARD NA_CTG_ENFORCE CROWDSEC_STRICT; do
+          ENABLE_BLOCKLISTS BLOCK_TOR ENABLE_CTGUARD NA_CTG_ENFORCE CROWDSEC_STRICT \
+          ENABLE_SCANNERS SCANNER_FEEDS; do
     [[ "${!_k}" =~ ^[01]$ ]] || { err "$_k='${!_k}' — ожидается 0 или 1"; exit 1; }
 done
+[[ "$SCANNER_ASN_SOURCE" =~ ^(auto|ripestat|whois)$ ]] || { err "SCANNER_ASN_SOURCE должно быть auto|ripestat|whois"; exit 1; }
+for _k in SCANNER_ASN_MAX_PREFIXES SCANNER_MIN_PREFIXLEN RIPESTAT_TIMEOUT WHOIS_TIMEOUT; do
+    [[ "${!_k}" =~ ^[0-9]+$ ]] || { err "$_k='${!_k}' — ожидается число"; exit 1; }
+done
+(( SCANNER_MIN_PREFIXLEN >= 8 && SCANNER_MIN_PREFIXLEN <= 32 )) || { err "SCANNER_MIN_PREFIXLEN вне 8..32"; exit 1; }
 [[ "$NODE_PORT_WHITELIST_ONLY" =~ ^(auto|0|1)$ ]] || { err "NODE_PORT_WHITELIST_ONLY должно быть auto|0|1"; exit 1; }
 [[ "$NODE_PORT_AUTOWL" =~ ^(auto|0|1)$ ]] || { err "NODE_PORT_AUTOWL должно быть auto|0|1"; exit 1; }
 [[ "$FLEET_SYNC" =~ ^(auto|0|1)$ ]] || { err "FLEET_SYNC должно быть auto|0|1"; exit 1; }
@@ -480,6 +503,7 @@ elif [[ "$FLEET_SYNC" == "1" || -n "$REMNAWAVE_NODES_URL" || ( -n "$REMNAWAVE_UR
     info "FW_MODE=skip: fleet-sync живёт в сетах na_filter — пропущен"
 fi
 [[ "$FW_MODE" == "skip" && "$ENABLE_BLOCKLISTS" == "1" ]] && info "FW_MODE=skip: блоклисты живут в сетах na_filter — пропущены"
+[[ "$FW_MODE" == "skip" && "$ENABLE_SCANNERS" == "1" ]] && info "FW_MODE=skip: сеты scanner_* живут в na_filter — блок сканеров пропущен"
 
 # ═══ ФАЙРВОЛ (nftables) — весь блок до CrowdSec пропускается при FW_MODE=skip ═══
 NP_EFF="$NODE_PORT"   # skip-режим: детект не гоняем, в маркер значение уходит как есть
@@ -720,6 +744,16 @@ if [[ "$ENABLE_BLOCKLISTS" == "1" ]]; then
         ip6 saddr @blocklist_v6 drop"
 fi
 
+# scanner-сеты (наполняет na-scanner-update таймером) + drop-правило.
+SCANNER_SETS=""; SCANNER_DROP=""
+if [[ "$ENABLE_SCANNERS" == "1" ]]; then
+    SCANNER_SETS="    set scanner_v4 { type ipv4_addr; flags interval; auto-merge; }
+    set scanner_v6 { type ipv6_addr; flags interval; auto-merge; }"
+    SCANNER_DROP="        # масс-сканеры (ASN-лист + префикс-фиды) — обновляет na-scanner-update
+        ip  saddr @scanner_v4 drop
+        ip6 saddr @scanner_v6 drop"
+fi
+
 # fleet-сеты (наполняет na-fleet-sync с панели Remnawave) + accept сразу после whitelist.
 # FLEET_ON резолвится выше (до блока файрвола — нужен и в skip-режиме).
 FLEET_SETS=""; FLEET_ACCEPT=""
@@ -804,6 +838,7 @@ table inet na_filter {
     set autoban_v6 { type ipv6_addr; flags timeout; size 65536; }
 $SUSPECT_SETS
 $BLOCKLIST_SETS
+$SCANNER_SETS
 $FLEET_SETS
 $NP_SETS
 
@@ -852,6 +887,7 @@ $FLEET_ACCEPT
         ip  saddr @autoban_v4 drop
         ip6 saddr @autoban_v6 drop
 $BLOCKLIST_DROP
+$SCANNER_DROP
 
 $ANTISPOOF
 
@@ -1036,7 +1072,10 @@ fi
 # ═══ v3.0 МОДУЛИ: fleet-sync · blocklists · ctguard ═══════════════════════════
 # Зависимости только под включённые модули (jq — fleet/blocklists, conntrack — ctguard).
 _dep_list=()
-{ [[ "$FLEET_ON" == "1" ]] || [[ "$ENABLE_BLOCKLISTS" == "1" && "$FW_MODE" != "skip" ]]; } && _dep_list+=(jq)
+{ [[ "$FLEET_ON" == "1" ]] || [[ "$ENABLE_BLOCKLISTS" == "1" && "$FW_MODE" != "skip" ]] \
+  || [[ "$ENABLE_SCANNERS" == "1" && "$FW_MODE" != "skip" ]]; } && _dep_list+=(jq)
+# whois — только фолбэк для ASN-резолва (RIPEstat идёт по HTTPS и обычно достаточен)
+[[ "$ENABLE_SCANNERS" == "1" && "$FW_MODE" != "skip" && "$SCANNER_ASN_SOURCE" != "ripestat" ]] && _dep_list+=(whois)
 [[ "$ENABLE_CTGUARD" == "1" ]] && _dep_list+=(conntrack)
 if [[ "${#_dep_list[@]}" -gt 0 ]]; then
     apt_install "${_dep_list[@]}" || warn "не доустановил зависимости: ${_dep_list[*]}"
@@ -1263,6 +1302,244 @@ EOF
     ok "блоклисты включены (обновление $BLOCKLIST_REFRESH). Лог: journalctl -t na-blocklist"
 fi
 
+# ── Масс-сканеры: ASN-лист (RIPEstat/whois) + префикс-фиды → сеты scanner_* ───
+if [[ "$ENABLE_SCANNERS" == "1" && "$FW_MODE" != "skip" ]]; then
+    title "Блок масс-сканеров (ASN + префикс-фиды)"
+    if [[ ! -f "$CONF_DIR/scanner-asns.txt" ]]; then
+        cat > "$CONF_DIR/scanner-asns.txt" <<'ASNS'
+# node-accelerator: ASN организаций, чьё ЕДИНСТВЕННОЕ занятие — массовое сканирование
+# и индексация интернета. Один ASN на строку, # — комментарий.
+#
+# КРИТЕРИЙ ВКЛЮЧЕНИЯ: весь трафик из AS является сканирующим. Хостинг/облако/CDN сюда
+# НЕ ВНОСИТЬ, даже если оттуда прилетают сканы — сканеров внутри Linode, Azure, GCP,
+# DigitalOcean режут ТОЛЬКО префикс-фиды (см. na-scanner-update). Блокировка облака
+# целиком по ASN выносит десятки тысяч легитимных адресов вместе с парой сканеров.
+#
+# Предохранитель: ASN, отдавший больше SCANNER_ASN_MAX_PREFIXES префиксов, пропускается
+# целиком с warn в лог — значит, он вырос в хостинг и его надо пересмотреть вручную.
+
+# Число в скобках — сколько IPv4-префиксов AS анонсировала на момент составления
+# списка. Растущее число = повод перепроверить, не превратилась ли контора в хостинг.
+
+# — исследовательские сканеры полного интернета —
+AS398324    # Censys, Inc. (ARIN-01)   (15)
+AS398705    # Censys, Inc. (ARIN-02)   (2)
+AS398722    # Censys, Inc. (ARIN-03)   (2)
+AS211298    # Driftnet Ltd             (4)
+AS213412    # ONYPHE SAS               (5)
+AS208843    # Alpha Strike Labs GmbH   (2)
+AS204428    # SS-Net / Stretchoid      (1)
+
+# — мелкие сети, с которых идёт устойчивый брут/скан и ничего кроме —
+AS202412    # Omegatech LTD            (21)
+AS214940    # KPROHOST LLC             (2)
+AS219502    # Storm Industries LLC     (1)
+AS213790    # Limited Network LTD      (5)
+
+# СОЗНАТЕЛЬНО НЕ ВКЛЮЧЕНЫ (проверено по RIPEstat) — оставлено как памятка, чтобы их
+# не внесли повторно:
+#   AS25369  Hydra Communications — 238 префиксов, это уже хостинг, а не сканер
+#   AS209425 KOI Cloud Services   — облачный провайдер
+#   AS396982 Google Cloud (3457), AS63949 Akamai/Linode, AS8075 Microsoft,
+#   AS14061 DigitalOcean          — сканеры внутри них режутся ТОЛЬКО префикс-фидами
+#   AS60068 CDN77, AS398101 GoDaddy, AS3214 xTom, AS200651 FlokiNET,
+#   AS137409 GSL Networks         — хостинги; в наблюдаемых списках сканеров не значатся
+ASNS
+        chmod 0644 "$CONF_DIR/scanner-asns.txt"
+        ok "создан $CONF_DIR/scanner-asns.txt (11 ASN). Правь его, а не скрипт."
+    else
+        info "$CONF_DIR/scanner-asns.txt уже есть — оставлен как есть."
+    fi
+
+    cat > /usr/local/sbin/na-scanner-update <<'SCUP'
+#!/usr/bin/env bash
+# na-scanner-update — наполняет nft-сеты scanner_v4/v6 сетями масс-сканеров.
+#
+# Два источника с разными областями применимости:
+#   • ASN-лист ($ASN_FILE) — только чисто-сканерные организации. Префиксы берутся с
+#     RIPEstat по HTTPS; whois RADB (TCP/43) — фолбэк, потому что часть хостеров режет
+#     исходящий 43-й порт и whois там висит до таймаута.
+#   • Префикс-фиды — сканеры внутри крупных облаков, которые по ASN резать нельзя.
+#
+# Три предохранителя, без которых такой блоклист опаснее атаки:
+#   1. ASN_MAX_PREFIXES — ASN, разросшийся в хостинг, пропускается целиком.
+#   2. MIN_PREFIXLEN — префикс короче /16 отбрасывается (защита от кривого фида).
+#   3. protected-IP — префикс, накрывающий свой адрес, шлюз, панель, ноду флота или
+#      whitelist, отбрасывается. Именно так блоклист не отрезает ноду от управления.
+# Отдельная nft-транзакция: битый фид не роняет na_filter; при пустом результате
+# остаётся last-known-good.
+set -u
+TAG=na-scanner
+CONF=/etc/node-accelerator/protect.conf
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF" 2>/dev/null
+ASN_FILE=/etc/node-accelerator/scanner-asns.txt
+CUSTOM=/etc/node-accelerator/custom-scanners.txt
+ASN_MAX_PREFIXES="${SCANNER_ASN_MAX_PREFIXES:-96}"
+MIN_PREFIXLEN="${SCANNER_MIN_PREFIXLEN:-16}"
+SRC="${SCANNER_ASN_SOURCE:-auto}"
+FEEDS="${SCANNER_FEEDS:-1}"
+RIPESTAT_TIMEOUT="${RIPESTAT_TIMEOUT:-15}"
+WHOIS_TIMEOUT="${WHOIS_TIMEOUT:-20}"
+
+nft list set inet na_filter scanner_v4 >/dev/null 2>&1 || { logger -t "$TAG" "сет scanner нет — выкл"; exit 0; }
+command -v curl >/dev/null 2>&1 || { logger -t "$TAG" "нет curl"; exit 1; }
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+: > "$TMP/v4.raw"; : > "$TMP/v6.raw"
+
+# ── protected: то, что нельзя дропнуть ни при каких фидах ────────────────────
+{
+    ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}'
+    ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}'
+    # элементы сета печатаются многострочно и по несколько в строке; берём всё, что
+    # похоже на IPv4, начиная со строки elements =. Сет может отсутствовать — не ошибка.
+    for s in whitelist_v4 na_fleet_v4 na_nodeport_wl_v4; do
+        nft list set inet na_filter "$s" 2>/dev/null \
+          | sed -n '/elements[[:space:]]*=/,$p' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}'
+    done
+} 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u > "$TMP/protected"
+NPROT="$(grep -c . "$TMP/protected" 2>/dev/null || echo 0)"
+# Пустой protected — это не «нечего защищать», а сломанный разбор. Без него блоклист
+# может накрыть панель, и мы этого не заметим: лучше громко отказаться от обновления.
+if [ "${NPROT:-0}" -lt 1 ]; then
+    logger -t "$TAG" "protected-список пуст (свой адрес не определился?) — обновление ОТМЕНЕНО, last-known-good"
+    exit 1
+fi
+
+ip2int() { local a b c d; IFS=. read -r a b c d <<<"$1"; echo $(( (a<<24)|(b<<16)|(c<<8)|d )); }
+# «накрывает ли CIDR хоть один protected-адрес» — только v4; v6 идёт без проверки,
+# поэтому v6-префиксы принимаются лишь из ASN-резолва, не из произвольных фидов.
+covers_protected() {
+    local cidr="$1" net len m ni
+    net="${cidr%/*}"; len="${cidr#*/}"; [ "$net" = "$cidr" ] && len=32
+    [ "$len" -ge 0 ] 2>/dev/null || return 1
+    if [ "$len" -eq 0 ]; then return 0; fi
+    m=$(( (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+    ni=$(( $(ip2int "$net") & m ))
+    local p
+    while read -r p; do
+        [ -n "$p" ] || continue
+        [ $(( $(ip2int "$p") & m )) -eq "$ni" ] && return 0
+    done < "$TMP/protected"
+    return 1
+}
+
+# ── ASN → префиксы ───────────────────────────────────────────────────────────
+_ripestat_v4() {
+    command -v jq >/dev/null 2>&1 || return 1
+    curl -fsSL --max-time "$RIPESTAT_TIMEOUT" --retry 1 \
+        "https://stat.ripe.net/data/announced-prefixes/data.json?resource=$1" 2>/dev/null \
+      | jq -r '.data.prefixes[]?.prefix // empty' 2>/dev/null
+}
+_whois_v4() {
+    command -v whois >/dev/null 2>&1 || return 1
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --kill-after=5 "$WHOIS_TIMEOUT" whois -h whois.radb.net -- "-i origin $1" 2>/dev/null
+    else
+        whois -h whois.radb.net -- "-i origin $1" 2>/dev/null
+    fi | awk '/^route:/{print $2}'
+}
+
+n_asn=0; n_skip=0
+if [ -r "$ASN_FILE" ]; then
+    while IFS= read -r line; do
+        asn="${line%%#*}"; asn="$(printf '%s' "$asn" | tr -d '[:space:]')"
+        [ -n "$asn" ] || continue
+        case "$asn" in AS[0-9]*) ;; *) continue ;; esac
+        pfx=""
+        [ "$SRC" != "whois" ] && pfx="$(_ripestat_v4 "$asn")"
+        if [ -z "$pfx" ] && [ "$SRC" != "ripestat" ]; then pfx="$(_whois_v4 "$asn")"; fi
+        [ -n "$pfx" ] || { logger -t "$TAG" "$asn: префиксы не получены — пропуск"; continue; }
+        cnt4="$(printf '%s\n' "$pfx" | grep -cE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+$' || true)"
+        if [ "${cnt4:-0}" -gt "$ASN_MAX_PREFIXES" ]; then
+            logger -t "$TAG" "$asn: ${cnt4} префиксов > лимита ${ASN_MAX_PREFIXES} — ПРОПУЩЕН целиком (вырос в хостинг? пересмотри $ASN_FILE)"
+            n_skip=$((n_skip+1)); continue
+        fi
+        printf '%s\n' "$pfx" | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+$' >> "$TMP/v4.raw"
+        printf '%s\n' "$pfx" | grep -E '^[0-9a-fA-F:]+/[0-9]+$' >> "$TMP/v6.raw"
+        n_asn=$((n_asn+1))
+    done < "$ASN_FILE"
+fi
+
+# ── префикс-фиды (сканеры внутри крупных облаков) ────────────────────────────
+# Внешние списки: содержимое подконтрольно их авторам, поэтому оно проходит ровно те
+# же три предохранителя, что и ASN-резолв, и НЕ может накрыть панель/флот/свой адрес.
+n_feed=0
+if [ "$FEEDS" = "1" ]; then
+    for u in \
+        "https://raw.githubusercontent.com/sancliffe/gcp-drop-mass-scanners/main/live_data/blacklist-scanners.txt" \
+        "https://raw.githubusercontent.com/cleverg0d/PublicGuard/main/scanners_list.txt" ; do
+        got="$(curl -fsSL --connect-timeout 10 --max-time 60 "$u" 2>/dev/null | grep -vE '^\s*#|^\s*$')" || continue
+        [ -n "$got" ] || continue
+        printf '%s\n' "$got" | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?$' >> "$TMP/v4.raw"
+        n_feed=$((n_feed + $(printf '%s\n' "$got" | grep -c . || echo 0)))
+    done
+fi
+[ -r "$CUSTOM" ] && grep -vE '^\s*#|^\s*$' "$CUSTOM" >> "$TMP/v4.raw"
+
+# ── фильтрация ───────────────────────────────────────────────────────────────
+n_wide=0; n_prot=0
+: > "$TMP/v4.clean"
+while read -r c; do
+    [ -n "$c" ] || continue
+    case "$c" in */*) len="${c#*/}" ;; *) c="$c/32"; len=32 ;; esac
+    [ "$len" -ge "$MIN_PREFIXLEN" ] 2>/dev/null || { n_wide=$((n_wide+1)); continue; }
+    case "$c" in 0.*|10.*|127.*|169.254.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*|22[4-9].*|23[0-9].*|24[0-9].*|25[0-5].*) continue ;; esac
+    if [ "$NPROT" -gt 0 ] && covers_protected "$c"; then
+        logger -t "$TAG" "префикс $c накрывает свой/панельный/флотовый адрес — ОТБРОШЕН"
+        n_prot=$((n_prot+1)); continue
+    fi
+    printf '%s\n' "$c" >> "$TMP/v4.clean"
+done < <(sort -u "$TMP/v4.raw")
+sort -u -o "$TMP/v4.clean" "$TMP/v4.clean"
+grep -E '^[0-9a-fA-F:]+/[0-9]+$' "$TMP/v6.raw" 2>/dev/null | sort -u > "$TMP/v6.clean"
+
+N4="$(grep -c . "$TMP/v4.clean" 2>/dev/null || echo 0)"
+N6="$(grep -c . "$TMP/v6.clean" 2>/dev/null || echo 0)"
+[ "$N4" -gt 0 ] || { logger -t "$TAG" "0 v4-записей (ASN=${n_asn}, фиды=${n_feed}) — last-known-good"; exit 0; }
+{
+    echo "flush set inet na_filter scanner_v4"
+    echo "add element inet na_filter scanner_v4 { $(paste -sd, "$TMP/v4.clean") }"
+    if [ "$N6" -gt 0 ]; then
+        echo "flush set inet na_filter scanner_v6"
+        echo "add element inet na_filter scanner_v6 { $(paste -sd, "$TMP/v6.clean") }"
+    fi
+} > "$TMP/sc.nft"
+if nft -f "$TMP/sc.nft" 2>/dev/null; then
+    mkdir -p /var/lib/node-accelerator && date +%s > /var/lib/node-accelerator/scanner.last
+    logger -t "$TAG" "scanner обновлён: ${N4} v4 + ${N6} v6 (ASN=${n_asn}, ASN-пропущено=${n_skip}, фид-строк=${n_feed}, широких=${n_wide}, защищённых=${n_prot})"
+else
+    logger -t "$TAG" "nft apply не прошёл — last-known-good"
+fi
+SCUP
+    chmod +x /usr/local/sbin/na-scanner-update
+    cat > /etc/systemd/system/na-scanner.service <<'EOF'
+[Unit]
+Description=node-accelerator mass-scanner blocklist update
+After=na-firewall.service network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/na-scanner-update
+EOF
+    cat > /etc/systemd/system/na-scanner.timer <<EOF
+[Unit]
+Description=node-accelerator scanner blocklist refresh timer
+[Timer]
+OnBootSec=180s
+OnUnitActiveSec=$SCANNER_REFRESH
+RandomizedDelaySec=1800
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now na-scanner.timer >/dev/null 2>&1 || true
+    /usr/local/sbin/na-scanner-update >/dev/null 2>&1 || true
+    _sc4="$(nft list set inet na_filter scanner_v4 2>/dev/null | tr ',' '\n' | grep -cE '[0-9]+\.[0-9]+' || echo 0)"
+    ok "блок сканеров включён: ${_sc4} v4-префиксов (обновление $SCANNER_REFRESH). Лог: journalctl -t na-scanner"
+fi
+
 # ── conntrack phantom-eviction (защита от distributed connect-and-hold) ───────
 if [[ "$ENABLE_CTGUARD" == "1" ]]; then
     title "conntrack-guard (phantom-eviction)$([[ "$NA_CTG_ENFORCE" == "1" ]] && echo ' [ENFORCE]' || echo ' [observe]')"
@@ -1484,6 +1761,8 @@ save_conf "$CONF_DIR/protect.conf" \
     PORTSCAN_BAN_TIME PORTSCAN_RATE PORTSCAN_BURST \
     ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC CROWDSEC_STRICT ENABLE_SYNPROXY \
     ENABLE_BLOCKLISTS BLOCK_TOR BLOCKLIST_REFRESH ENABLE_BANONCE SUSPECT_TIME \
+    ENABLE_SCANNERS SCANNER_REFRESH SCANNER_ASN_SOURCE SCANNER_ASN_MAX_PREFIXES \
+    SCANNER_MIN_PREFIXLEN SCANNER_FEEDS RIPESTAT_TIMEOUT WHOIS_TIMEOUT \
     FLEET_SYNC FLEET_SYNC_INTERVAL \
     NODE_PORT_WHITELIST_ONLY NODE_PORT_LAST NODE_PORT_AUTOWL NODE_PORT_PEERS SAFETY_DELAY \
     ENABLE_CTGUARD NA_CTG_ENFORCE NA_CTG_PHANTOM_MIN NA_CTG_LIVE_FLOOR \

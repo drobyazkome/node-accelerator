@@ -200,11 +200,11 @@ focus_ip() {
     # членство во ВСЕХ наших nft-сетах (точная проверка, не grep)
     fam=v4; [[ "$ip" == *:* ]] && fam=v6
     if command -v nft >/dev/null 2>&1; then
-        for base in autoban suspect blocklist na_fleet; do
+        for base in autoban suspect blocklist scanner na_fleet; do
             nft get element inet na_filter "${base}_${fam}" "{ $ip }" >/dev/null 2>&1 && found="$found ${base}_${fam}"
         done
     fi
-    status_line "$([[ "$found" == *autoban* || "$found" == *blocklist* ]] && echo FAIL || { [[ -n "$found" ]] && echo WARN || echo OK; })" "в nft-сетах:${found:- (нет)}"
+    status_line "$([[ "$found" == *autoban* || "$found" == *blocklist* || "$found" == *scanner* ]] && echo FAIL || { [[ -n "$found" ]] && echo WARN || echo OK; })" "в nft-сетах:${found:- (нет)}"
     # reverse-DNS + паттерн сканера
     ptr="$(getent hosts "$ip" 2>/dev/null | awk '{print $2; exit}')"
     [[ -z "$ptr" ]] && command -v dig >/dev/null 2>&1 && ptr="$(dig +short +time=3 +tries=1 -x "$ip" 2>/dev/null | head -1 | sed 's/\.$//')"

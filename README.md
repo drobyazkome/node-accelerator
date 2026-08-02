@@ -120,8 +120,8 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 ```
 
 > **Про подписи в этом форке.** `NA_REQUIRE_SIG=1` здесь работать не будет. Приватный
-> ключ принадлежит upstream, а форк изменил четыре из пяти подписанных модулей
-> (`protect.sh`, `optimize.sh`, `rollback.sh`, `na-report.sh`), так что подписать их
+> ключ принадлежит upstream, а форк изменил пять из шести подписанных файлов
+> (`protect.sh`, `optimize.sh`, `rollback.sh`, `na-report.sh`, `lib/common.sh`), так что подписать их
 > заново нечем. Протухшие `.minisig` из дерева удалены намеренно: честное «нет .minisig
 > для protect.sh» лучше, чем «подпись не сошлась» — второе выглядит как взлом там, где
 > его нет. Валидной осталась только подпись `diagnose.sh` (файл не менялся). Целостность

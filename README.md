@@ -119,6 +119,14 @@ export NA_REF=v3.9.2 NA_REQUIRE_SIG=1 \
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 ```
 
+> **Про подписи в этом форке.** `NA_REQUIRE_SIG=1` здесь работать не будет. Приватный
+> ключ принадлежит upstream, а форк изменил четыре из пяти подписанных модулей
+> (`protect.sh`, `optimize.sh`, `rollback.sh`, `na-report.sh`), так что подписать их
+> заново нечем. Протухшие `.minisig` из дерева удалены намеренно: честное «нет .minisig
+> для protect.sh» лучше, чем «подпись не сошлась» — второе выглядит как взлом там, где
+> его нет. Валидной осталась только подпись `diagnose.sh` (файл не менялся). Целостность
+> здесь держится на пиннинге тега `NA_REF`, как и в апстримовском bootstrap-режиме.
+
 > После установки **XanMod нужна перезагрузка** (`reboot`), чтобы BBRv3 заработал. Проверка: `uname -r` содержит `xanmod`.
 
 ---

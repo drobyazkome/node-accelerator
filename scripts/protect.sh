@@ -1535,9 +1535,23 @@ WantedBy=timers.target
 EOF
     systemctl daemon-reload
     systemctl enable --now na-scanner.timer >/dev/null 2>&1 || true
+    # Наполняем сет и ПРОВЕРЯЕМ результат. Первый прогон может уйти впустую: если
+    # na_filter перезагружается после него, сет обнуляется, а таймер вернётся только
+    # через неделю — то есть защита молча не работает всё это время. Поэтому одна
+    # повторная попытка, а если и она пустая — предупреждение, а не тихий успех.
+    _sc_count() { nft -j list set inet na_filter scanner_v4 2>/dev/null \
+        | jq '[.nftables[].set.elem[]?] | length' 2>/dev/null || echo 0; }
     /usr/local/sbin/na-scanner-update >/dev/null 2>&1 || true
-    _sc4="$(nft list set inet na_filter scanner_v4 2>/dev/null | tr ',' '\n' | grep -cE '[0-9]+\.[0-9]+' || echo 0)"
-    ok "блок сканеров включён: ${_sc4} v4-префиксов (обновление $SCANNER_REFRESH). Лог: journalctl -t na-scanner"
+    _sc4="$(_sc_count)"
+    if [[ "${_sc4:-0}" -lt 1 ]]; then
+        /usr/local/sbin/na-scanner-update >/dev/null 2>&1 || true
+        _sc4="$(_sc_count)"
+    fi
+    if [[ "${_sc4:-0}" -lt 1 ]]; then
+        warn "сет scanner_v4 пуст после двух попыток — фиды недоступны? Проверь: journalctl -t na-scanner; наполнить вручную: na-scanner-update"
+    else
+        ok "блок сканеров включён: ${_sc4} интервалов в scanner_v4 (обновление $SCANNER_REFRESH). Лог: journalctl -t na-scanner"
+    fi
 fi
 
 # ── conntrack phantom-eviction (защита от distributed connect-and-hold) ───────

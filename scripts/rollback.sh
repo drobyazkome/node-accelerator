@@ -82,7 +82,7 @@ rollback_protect() {
     rm -f "$STATE_DIR/na-fw-safety.pid" "$STATE_DIR/na-fw-safety.log" /tmp/na-fw-safety.pid /tmp/na-fw-safety.log 2>/dev/null || true
 
     # v3.0 модули: fleet-sync / blocklists / ctguard — снимаем таймеры/сервисы
-    for unit in na-firewall na-fleet-sync na-blocklist na-scanner na-ctguard; do
+    for unit in na-firewall na-fleet-sync na-blocklist na-scanner na-scanner-restore na-ctguard; do
         systemctl disable --now "$unit.service" >/dev/null 2>&1 || true
         systemctl disable --now "$unit.timer"   >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/$unit.service" "/etc/systemd/system/$unit.timer"
@@ -103,7 +103,7 @@ rollback_protect() {
     rm -f /etc/modules-load.d/na-synproxy.conf "$STATE_DIR/.synproxy-degraded"
     # конфиги: persisted protect.conf, ctguard.conf, токен панели fleet.env (custom-blocklist.txt — данные оператора, оставляем)
     rm -f "$STATE_DIR/protect.installed" "$CONF_DIR/protect.conf" "$CONF_DIR/ctguard.conf" "$CONF_DIR/fleet.env"
-    rm -f "$STATE_DIR/fleet-sync.last" "$STATE_DIR/blocklist.last" "$STATE_DIR/scanner.last"
+    rm -f "$STATE_DIR/fleet-sync.last" "$STATE_DIR/blocklist.last" "$STATE_DIR/scanner.last" "$STATE_DIR/scanner-cache.nft"
     [[ -f "$CONF_DIR/custom-blocklist.txt" ]] && info "оставлен $CONF_DIR/custom-blocklist.txt (данные оператора)"
     [[ -f "$CONF_DIR/scanner-asns.txt" ]] && info "оставлен $CONF_DIR/scanner-asns.txt (данные оператора)"
     ok "na_filter/na_ctguard удалены, сервисы и таймеры сняты"

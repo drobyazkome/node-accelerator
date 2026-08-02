@@ -1507,6 +1507,11 @@ N6="$(grep -c . "$TMP/v6.clean" 2>/dev/null || echo 0)"
 } > "$TMP/sc.nft"
 if nft -f "$TMP/sc.nft" 2>/dev/null; then
     mkdir -p /var/lib/node-accelerator && date +%s > /var/lib/node-accelerator/scanner.last
+    # Кэш применённого набора. Сеты nft живут только в памяти ядра: после ребута
+    # scanner_* пустые, а таймер придёт лишь через свой интервал — на живой ноде
+    # это оказалось ~12 минут полностью без блоклиста. na-scanner-restore.service
+    # заливает этот файл сразу после na-firewall, ещё до появления сети наружу.
+    cp -f "$TMP/sc.nft" /var/lib/node-accelerator/scanner-cache.nft 2>/dev/null || true
     logger -t "$TAG" "scanner обновлён: ${N4} v4 + ${N6} v6 (ASN=${n_asn}, ASN-пропущено=${n_skip}, фид-строк=${n_feed}, широких=${n_wide}, защищённых=${n_prot})"
 else
     logger -t "$TAG" "nft apply не прошёл — last-known-good"
@@ -1534,6 +1539,25 @@ Persistent=true
 WantedBy=timers.target
 EOF
     systemctl daemon-reload
+    # Восстановление сета при загрузке из кэша — без сети, мгновенно. Без него нода
+    # после каждого ребута какое-то время стоит с пустым scanner_*: сеты nft не
+    # переживают перезагрузку, а таймер приходит по своему расписанию (замерено на
+    # живой ноде: ~12 минут открытого окна).
+    cat > /etc/systemd/system/na-scanner-restore.service <<'EOF'
+[Unit]
+Description=node-accelerator: restore scanner blocklist from cache at boot
+After=na-firewall.service nftables.service
+Wants=na-firewall.service
+ConditionPathExists=/var/lib/node-accelerator/scanner-cache.nft
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /var/lib/node-accelerator/scanner-cache.nft
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable na-scanner-restore.service >/dev/null 2>&1 || true
     systemctl enable --now na-scanner.timer >/dev/null 2>&1 || true
     # Наполняем сет и ПРОВЕРЯЕМ результат. Первый прогон может уйти впустую: если
     # na_filter перезагружается после него, сет обнуляется, а таймер вернётся только

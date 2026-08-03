@@ -92,11 +92,13 @@ rollback_protect() {
     # удаляем ТОЛЬКО свои таблицы — CrowdSec/Docker не трогаем
     nft delete table inet na_filter  2>/dev/null || true
     nft delete table inet na_ctguard 2>/dev/null || true
+    nft delete table inet na_panic   2>/dev/null || true
     rm -f "$CONF_DIR/na_filter.nft"
     rm -f /usr/local/sbin/na-fw-status /usr/local/sbin/na-fw-top-talkers \
+          /usr/local/sbin/na-fw-panic /usr/local/sbin/na-fw-logs \
           /usr/local/sbin/na-fleet-sync /usr/local/sbin/na-blocklist-update /usr/local/sbin/na-scanner-update /usr/local/sbin/na-ctguard \
           /usr/local/sbin/na-fw-safety-revert
-    rm -f "$STATE_DIR/safety-fired.last" "$STATE_DIR/protect.lock"
+    rm -f "$STATE_DIR/safety-fired.last" "$STATE_DIR/protect.lock" "$STATE_DIR/panic.on"
     # nftables.service мы включали (boot-persist), но выключать не будем: он лишь грузит
     # /etc/nftables.conf, который тулкит никогда не писал — трогать чужой конфиг нельзя.
     systemctl is-enabled --quiet nftables 2>/dev/null && info "nftables.service оставлен включённым (грузит ваш /etc/nftables.conf, наших правил там нет)"

@@ -415,6 +415,10 @@ write_safety_revert() {
 #!/bin/sh
 # na-fw-safety-revert — аварийный откат файрвола (ставится protect.sh, снимается rollback).
 /usr/sbin/nft delete table inet na_filter 2>/dev/null
+# na_panic сам по себе запереть не может (policy accept, SSH исключён), но оставлять
+# ужесточённые лимиты после аварийного отката смысла нет — сейфти снимает всё наше.
+/usr/sbin/nft delete table inet na_panic 2>/dev/null
+rm -f /var/lib/node-accelerator/panic.on 2>/dev/null
 systemctl disable na-firewall.service >/dev/null 2>&1
 mkdir -p /var/lib/node-accelerator 2>/dev/null
 date +%s > /var/lib/node-accelerator/safety-fired.last 2>/dev/null
@@ -1716,6 +1720,14 @@ fi
 # ─── fw-status хелпер ────────────────────────────────────────────────────────
 cat > /usr/local/sbin/na-fw-status <<'STAT'
 #!/usr/bin/env bash
+# Panic — первым и громко: это временный режим, который режет и легитимных
+# клиентов. Забытый включённым panic выглядит как «сервис тормозит без причины».
+if nft list table inet na_panic >/dev/null 2>&1; then
+    echo "⚠⚠  PANIC-РЕЖИМ АКТИВЕН — лимиты ужесточены, часть легитимных клиентов режется"
+    echo "    $(cat /var/lib/node-accelerator/panic.on 2>/dev/null)"
+    echo "    Снять: na-fw-panic off"
+    echo
+fi
 echo "── nft table inet na_filter ──"
 nft list table inet na_filter 2>/dev/null | grep -E 'policy|counter|elements' | head -40
 echo
@@ -1787,6 +1799,243 @@ ss -Hnt state established "( $filt )" 2>/dev/null \
 TT
 chmod +x /usr/local/sbin/na-fw-top-talkers
 
+# ─── panic-режим ─────────────────────────────────────────────────────────────
+# Под живой атакой «поправить protect.conf и ре-ранить protect.sh» — плохой план:
+# это минуты работы, и na_filter.nft начинается с `delete table inet na_filter`,
+# то есть пересборка ОБНУЛЯЕТ autoban/suspect/блоклисты/fleet ровно в тот момент,
+# когда они нужнее всего (сеты nft живут только в памяти ядра).
+# Поэтому panic — ОТДЕЛЬНАЯ таблица inet na_panic с приоритетом -3: после
+# crowdsec (-10) и ctguard (-5), но перед na_filter (0). Она только режет NEW
+# сверх ужесточённого потолка и снимается одной командой; na_filter не трогается.
+cat > /usr/local/sbin/na-fw-panic <<'PANIC'
+#!/usr/bin/env bash
+# na-fw-panic on [--mult=N] | off | status
+#
+# Аварийное ужесточение per-IP лимитов в N раз (по умолчанию 4) поверх обычной
+# защиты. Отдельная таблица inet na_panic — na_filter (баны, блоклисты, счётчики)
+# остаётся нетронутой, снятие мгновенное.
+#
+# ⚠️ ВАЖНО: panic бьёт и по легитимным клиентам. Он помогает, когда флуд идёт с
+# горстки IP, и НЕ помогает, когда он размазан по сотням адресов по чуть-чуть —
+# там per-IP лимиты бессильны by design. Сначала `na-diagnose --attack`.
+set -u
+CONF=/etc/node-accelerator/protect.conf
+STATE=/var/lib/node-accelerator
+MARK="$STATE/panic.on"
+MULT=4
+
+die() { echo "na-fw-panic: $*" >&2; exit 1; }
+
+for a in "$@"; do
+    case "$a" in
+        --mult=*) MULT="${a#*=}" ;;
+    esac
+done
+case "$MULT" in ''|*[!0-9]*) die "--mult должен быть целым числом" ;; esac
+[ "$MULT" -ge 2 ] || die "--mult меньше 2 не имеет смысла"
+
+# Делим лимит, но не ниже 1: 0/second означало бы «дропать всё».
+d() { local v=$(( ${1:-4} / MULT )); [ "$v" -lt 1 ] && v=1; echo "$v"; }
+
+# Элементы whitelist берём из ЖИВОГО na_filter, а не из protect.conf: там уже
+# лежит транзитный IP текущей SSH-сессии, добавленный при установке. Читать
+# конфиг значило бы запереть себя же при первом panic on.
+# [^}]* вместо .* принципиально: sed жадный, и `\(.*\)}` захватывал бы всё до
+# ПОСЛЕДНЕЙ скобки в дампе, утаскивая закрывающие скобки самого set/table.
+wl_elements() {
+    nft list set inet na_filter "$1" 2>/dev/null | tr '\t\n' '  ' \
+        | sed -n 's/.*elements = {\([^}]*\)}.*/\1/p' | tr -s ' ' | sed 's/^ *//; s/ *$//'
+}
+
+panic_status() {
+    if nft list table inet na_panic >/dev/null 2>&1; then
+        echo "PANIC АКТИВЕН$([ -r "$MARK" ] && echo " — $(cat "$MARK")")"
+        echo
+        nft list table inet na_panic 2>/dev/null | grep -E 'counter packets [1-9]|dport' | head -30
+        echo
+        echo "Снять: na-fw-panic off"
+    else
+        echo "panic выключен (обычные лимиты)"
+        [ -r "$MARK" ] && rm -f "$MARK"
+    fi
+}
+
+panic_off() {
+    nft list table inet na_panic >/dev/null 2>&1 || { echo "panic и так выключен"; exit 0; }
+    nft delete table inet na_panic || die "не смог удалить таблицу na_panic"
+    rm -f "$MARK"
+    echo "panic снят — вернулись к обычным лимитам na_filter"
+}
+
+panic_on() {
+    [ -r "$CONF" ] || die "нет $CONF — protect.sh здесь не запускался"
+    # shellcheck disable=SC1090
+    . "$CONF"
+    : "${TCP_PORTS:=}" "${UDP_PORTS:=}" "${UDP_BULK_PORTS:=}" "${SSH_PORT:=22}" "${NODE_PORT:=}"
+    : "${SYN_RATE:=60}" "${SYN_BURST:=120}" "${UDP_RATE:=200}" "${UDP_BURST:=400}"
+    : "${UDP_BULK_RATE:=50000}" "${UDP_BULK_BURST:=100000}" "${CONN_LIMIT:=2048}"
+
+    local sr sb ur ub br bb cl rules="" p
+    sr=$(d "$SYN_RATE");        sb=$(d "$SYN_BURST")
+    ur=$(d "$UDP_RATE");        ub=$(d "$UDP_BURST")
+    br=$(d "$UDP_BULK_RATE");   bb=$(d "$UDP_BULK_BURST")
+    cl=$(d "$CONN_LIMIT")
+
+    for p in ${TCP_PORTS//,/ }; do
+        [ -n "$p" ] || continue
+        # SSH и node-port из panic исключены намеренно: у SSH своя connect-flood
+        # защита в na_filter, а срезанный node-port — это отвал панели от ноды
+        # посреди атаки. Ужесточать имеет смысл клиентские порты.
+        # SSH_PORT/NODE_PORT могут быть списками ("22,2222") — сравнение целиком
+        # их бы не исключило, поэтому ищем порт как элемент списка.
+        case ",${SSH_PORT}," in *",${p},"*) continue ;; esac
+        case ",${NODE_PORT}," in *",${p},"*) continue ;; esac
+        rules="$rules
+        tcp dport ${p} ct state new meter pt4_${p} { ip  saddr limit rate over ${sr}/second burst ${sb} packets } jump pdrop
+        tcp dport ${p} ct state new meter pt6_${p} { ip6 saddr limit rate over ${sr}/second burst ${sb} packets } jump pdrop
+        tcp dport ${p} ct state new meter pc4_${p} { ip  saddr ct count over ${cl} } jump pdrop
+        tcp dport ${p} ct state new meter pc6_${p} { ip6 saddr ct count over ${cl} } jump pdrop"
+    done
+
+    for p in ${UDP_PORTS//,/ }; do
+        [ -n "$p" ] || continue
+        local r="$ur" b="$ub"
+        case ",${UDP_BULK_PORTS}," in *",${p},"*) r="$br"; b="$bb" ;; esac
+        rules="$rules
+        udp dport ${p} meter pu4_${p} { ip  saddr limit rate over ${r}/second burst ${b} packets } jump pdrop
+        udp dport ${p} meter pu6_${p} { ip6 saddr limit rate over ${r}/second burst ${b} packets } jump pdrop"
+    done
+
+    [ -n "$rules" ] || die "в protect.conf нет портов, которые имеет смысл ужесточать"
+
+    local e4 e6 wl4="" wl6=""
+    e4="$(wl_elements whitelist_v4)"; e6="$(wl_elements whitelist_v6)"
+    [ -n "$e4" ] && wl4="elements = { $e4 }"
+    [ -n "$e6" ] && wl6="elements = { $e6 }"
+
+    local tmp; tmp="$(mktemp /tmp/na-panic.XXXXXX.nft)" || die "mktemp"
+    cat > "$tmp" <<NFT
+table inet na_panic {}
+delete table inet na_panic
+
+table inet na_panic {
+    set pwl4 { type ipv4_addr; flags interval; auto-merge; $wl4 }
+    set pwl6 { type ipv6_addr; flags interval; auto-merge; $wl6 }
+
+    # Один общий chain на дроп: если бы log/counter/drop были тремя отдельными
+    # правилами с одинаковым meter, лимит пересчитывался бы на каждом и по факту
+    # оказался бы втрое строже заданного.
+    chain pdrop {
+        limit rate 5/second burst 10 packets log prefix "[na panic] " level warn
+        counter drop
+    }
+
+    chain input {
+        type filter hook input priority -3; policy accept;
+
+        # Живые сессии не трогаем — panic режет только НОВЫЕ подключения.
+        # Иначе ужесточение обрывало бы уже работающих клиентов, а не атакующих.
+        ct state established,related accept
+        ip  saddr @pwl4 accept
+        ip6 saddr @pwl6 accept
+$rules
+    }
+}
+NFT
+    if ! nft -c -f "$tmp"; then
+        echo "na-fw-panic: сгенерированный ruleset не прошёл проверку. Файл: $tmp" >&2
+        exit 1
+    fi
+    nft -f "$tmp" || die "не смог применить na_panic"
+    rm -f "$tmp"
+
+    mkdir -p "$STATE"
+    echo "mult=${MULT} since=$(date -Is) syn=${sr}/s conn=${cl} udp=${ur}/s" > "$MARK"
+    echo "PANIC ВКЛЮЧЁН (×${MULT} строже): syn ${SYN_RATE}→${sr}/s, conn ${CONN_LIMIT}→${cl}, udp ${UDP_RATE}→${ur}/s"
+    echo "SSH (${SSH_PORT}) и node-port (${NODE_PORT:-—}) не ужесточались."
+    echo
+    echo "Смотреть срабатывания: na-fw-logs -f --panic"
+    echo "Снять:                 na-fw-panic off"
+}
+
+case "${1:-status}" in
+    on)     panic_on ;;
+    off)    panic_off ;;
+    status) panic_status ;;
+    *) echo "usage: na-fw-panic on [--mult=N] | off | status" >&2; exit 1 ;;
+esac
+PANIC
+chmod +x /usr/local/sbin/na-fw-panic
+
+# ─── просмотр срабатываний файрвола ──────────────────────────────────────────
+# Правила пишут в kernel log с префиксами [na synflood]/[na portscan]/
+# [na ssh-flood]/[na badflags]/[na panic]. Под атакой смотреть их голым
+# journalctl -k неудобно: нужен фильтр по IP или порту, а поля лежат внутри
+# строки (SRC=..., DPT=...), не в journald-полях.
+cat > /usr/local/sbin/na-fw-logs <<'FWLOG'
+#!/usr/bin/env bash
+# na-fw-logs [-f] [--lines=N] [--ip=IP] [--port=PORT] [--kind=synflood|portscan|ssh-flood|badflags|panic]
+#            [--panic] [--top]
+#
+# Читает срабатывания правил na_filter/na_panic из kernel log.
+# --top — не поток строк, а сводка «топ источников» за выбранное окно.
+set -u
+LINES=200; FOLLOW=0; IP=""; PORT=""; KIND=""; TOP=0
+
+for a in "$@"; do
+    case "$a" in
+        -f|--follow) FOLLOW=1 ;;
+        --lines=*)   LINES="${a#*=}" ;;
+        --ip=*)      IP="${a#*=}" ;;
+        --port=*)    PORT="${a#*=}" ;;
+        --kind=*)    KIND="${a#*=}" ;;
+        --panic)     KIND="panic" ;;
+        --top)       TOP=1 ;;
+        -h|--help)   sed -n '2,9p' "$0"; exit 0 ;;
+        *) echo "na-fw-logs: неизвестный аргумент: $a" >&2; exit 1 ;;
+    esac
+done
+
+# Логирование могло быть не включено вовсе — тогда пустой вывод собьёт с толку.
+if ! nft list table inet na_filter 2>/dev/null | grep -q 'log prefix "\[na '; then
+    echo "⚠ в na_filter нет log-правил — срабатывания в kernel log не пишутся." >&2
+    echo "  Счётчики дропов при этом видны: na-fw-status" >&2
+fi
+
+PAT="\[na ${KIND:-[a-z-]*}\]"
+src() {
+    if [ "$FOLLOW" = 1 ]; then
+        journalctl -k -f -n "$LINES" -o cat 2>/dev/null
+    else
+        journalctl -k -n 20000 --no-pager -o cat 2>/dev/null
+    fi
+}
+
+filter() {
+    grep -E --line-buffered "$PAT" \
+      | { [ -n "$IP" ]   && grep -E --line-buffered "SRC=${IP//./\\.}[ =]" || cat; } \
+      | { [ -n "$PORT" ] && grep -E --line-buffered "DPT=${PORT}[ =]" || cat; }
+}
+
+if [ "$TOP" = 1 ]; then
+    [ "$FOLLOW" = 1 ] && { echo "na-fw-logs: --top и -f несовместимы" >&2; exit 1; }
+    echo "── Топ источников по срабатываниям ${KIND:+($KIND) }──"
+    src | filter | grep -oE 'SRC=[0-9a-fA-F.:]+' | sed 's/^SRC=//' \
+        | sort | uniq -c | sort -rn | head -25
+    echo
+    echo "── По типам правил ──"
+    src | filter | grep -oE '\[na [a-z-]+\]' | sort | uniq -c | sort -rn
+    exit 0
+fi
+
+if [ "$FOLLOW" = 1 ]; then
+    src | filter
+else
+    src | filter | tail -n "$LINES"
+fi
+FWLOG
+chmod +x /usr/local/sbin/na-fw-logs
+
 # ─── Маркер ──────────────────────────────────────────────────────────────────
 mkdir -p "$STATE_DIR"
 cat > "$STATE_DIR/protect.installed" <<EOF
@@ -1846,4 +2095,6 @@ else
     echo
     [[ "$FW_MODE" == "open" ]] && info "FW_MODE=open: не перечисленные порты открыты. Появится полный список — закрой всё ре-раном с FW_MODE=strict TCP_PORTS=… UDP_PORTS=…"
     ok "Готово. Статус: na-fw-status | топ источников (для WHITELIST за CDN/LB): na-fw-top-talkers"
+    info "Под атакой: na-diagnose --attack (форма атаки) → na-fw-panic on (×4 строже) → na-fw-panic off"
+    info "Срабатывания правил: na-fw-logs -f [--ip=X] [--port=N] | сводка: na-fw-logs --top"
 fi

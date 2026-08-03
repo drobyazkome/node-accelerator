@@ -6,6 +6,7 @@
 #   diagnose.sh             — человекочитаемый отчёт
 #   diagnose.sh --json      — один JSON-объект для флот-мониторинга (Zabbix/Prometheus)
 #   diagnose.sh --retrans [--window N]  — глубокий разбор причин TCP-retransmits
+#   diagnose.sh --attack  [--window N]  — форма текущей атаки (нужен ли na-fw-panic)
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,6 +72,9 @@ emit_json() {
         [[ "${enf:-0}" == 1 ]] && ctg=enforce || ctg=observe
     else ctg=off; fi
     [[ -f "$STATE_DIR/.synproxy-degraded" ]] && syndeg=true || syndeg=false
+    # panic — временный режим; забытым он тихо режет легитимный трафик, поэтому
+    # его видно во флот-мониторинге, а не только локально в na-fw-status.
+    local panic; nft list table inet na_panic >/dev/null 2>&1 && panic=true || panic=false
     { systemctl is-active --quiet na-fw-safety.timer 2>/dev/null \
       || { [[ -f "$STATE_DIR/na-fw-safety.pid" ]] && kill -0 "$(cat "$STATE_DIR/na-fw-safety.pid" 2>/dev/null)" 2>/dev/null; }; } \
       && safety=true || safety=false
@@ -135,7 +139,7 @@ emit_json() {
     printf '"congestion_control":"%s","qdisc":"%s","conntrack_max":%s,"conntrack_count":%s,"conntrack_pct":%s,' "${cc:-}" "${qd:-}" "$ctmax" "$ctcnt" "$ctpct"
     printf '"ulimit_n":%s,"min_snd_mss":%s,"mtu_probing":%s,"mss_collapsed_sockets":%s,' "${uln:-0}" "$minsnd" "$mtuprobe" "${collapsed:-0}"
     printf '"firewall":%s,"fw_mode":"%s","autoban_v4":%s,"autoban_v6":%s,"suspect":%s,"blocklist_v4":%s,"blocklist_v6":%s,' "$fw" "$fwm" "$ab4" "$ab6" "$susp" "$bl4" "$bl6"
-    printf '"fleet_v4":%s,"fleet_v6":%s,"crowdsec":%s,"ctguard":"%s","synproxy_degraded":%s,' "$fl4" "$fl6" "$crowd" "$ctg" "$syndeg"
+    printf '"fleet_v4":%s,"fleet_v6":%s,"crowdsec":%s,"ctguard":"%s","synproxy_degraded":%s,"panic":%s,' "$fl4" "$fl6" "$crowd" "$ctg" "$syndeg" "$panic"
     printf '"safety_armed":%s,"safety_fired_age_s":%s,"fw_boot_enabled":%s,"reboot_needed":%s,' "$safety" "$sfa" "$fwboot" "$rebootn"
     printf '"na_version":"%s","hostname":"%s","uptime_s":%s,"load1":%s,"mem_used_pct":%s,' "$nav" "$host" "$up" "$load1" "$mempct"
     printf '"wan_iface":"%s","wan_rx_bytes":%s,"wan_tx_bytes":%s,"ipv6_default":%s,"udp_rcvbuf_errors":%s,' "$wi" "$wanrx" "$wantx" "$ip6def" "$udperr"
@@ -264,6 +268,99 @@ I
     echo
 }
 if [[ "${1:-}" == "--retrans" ]]; then shift; retrans_deep "$@"; exit 0; fi
+
+# ─── Форма атаки (`--attack`) ────────────────────────────────────────────────
+# Основной отчёт отвечает на «здорова ли нода». Этот режим отвечает на другой
+# вопрос — «что именно по нам сейчас бьёт», потому что от формы атаки зависит,
+# поможет ли ужесточение per-IP лимитов (na-fw-panic) или оно только выбьет
+# своих же клиентов. Read-only, как и всё остальное в diagnose.
+attack_shape() {
+    local win=2
+    [[ "${1:-}" == "--window" && -n "${2:-}" ]] && win="$2"
+
+    title "Состояния TCP-соединений"
+    # Много SYN-RECV при малом ESTAB — классический SYN-flood (или SYN-скан).
+    # Много ESTAB при почти нулевом SYN-RECV, но с одного-двух IP — connect-and-hold.
+    local st_synrecv st_estab
+    st_synrecv="$(ss -Htan state syn-recv 2>/dev/null | wc -l)"
+    st_estab="$(ss -Htan state established 2>/dev/null | wc -l)"
+    ss -Htan 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -rn | head -8 | sed 's/^/    /'
+    info "SYN-RECV=${st_synrecv}  ESTABLISHED=${st_estab}"
+
+    title "Топ-15 источников по числу соединений"
+    # Ключевой вопрос: атака сконцентрирована или размазана. Если верхние строки
+    # на порядок выше остальных — per-IP лимиты сработают. Если у всех по 1-2
+    # соединения и таких IP сотни — per-IP потолки бессильны by design.
+    # state connected, а не все сокеты: иначе в «топ источников» лезут LISTEN-строки
+    # (0.0.0.0:*, *:*) и собственный адрес ноды, и картина атаки в них тонет.
+    # ::ffff:1.2.3.4 — это v4-клиент на dual-stack сокете; без нормализации один и
+    # тот же адрес считался бы дважды.
+    local top1 uniqsrc
+    _peers() {
+        ss -Htan state connected 2>/dev/null | awk '{print $5}' \
+            | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff://'
+    }
+    _peers | sort | uniq -c | sort -rn | head -15 | sed 's/^/    /'
+    top1="$(_peers | sort | uniq -c | sort -rn | head -1 | awk '{print $1+0}')"
+    uniqsrc="$(_peers | sort -u | wc -l)"
+    info "уникальных источников: ${uniqsrc}, максимум с одного IP: ${top1:-0}"
+
+    title "Дропы нашего файрвола"
+    if nft list table inet na_filter >/dev/null 2>&1; then
+        nft list table inet na_filter 2>/dev/null \
+            | grep -E 'counter packets [1-9][0-9]* ' | grep -E 'drop|jump' | head -12 | sed 's/^/    /'
+        info "живых банов: v4=$(nft list set inet na_filter autoban_v4 2>/dev/null | grep -c timeout) v6=$(nft list set inet na_filter autoban_v6 2>/dev/null | grep -c timeout)"
+        if nft list table inet na_panic >/dev/null 2>&1; then
+            bad "PANIC АКТИВЕН — лимиты ужесточены, легитимные клиенты тоже режутся ($(cat /var/lib/node-accelerator/panic.on 2>/dev/null))"
+        fi
+    else
+        wrn "таблица na_filter отсутствует — файрвол не установлен"
+    fi
+
+    title "Скорость на интерфейсе (замер ${win}с)"
+    # Самая важная проверка и самая часто пропускаемая: если rx уже упирается в
+    # полосу аплинка, пакеты теряются ДО нашего ядра, и никакой firewall на ноде
+    # не поможет — вопрос только к провайдеру/ДЦ.
+    local iface rp1 rp2 rb1 rb2 pps mbps
+    iface="$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')"
+    if [[ -n "$iface" && -r "/sys/class/net/$iface/statistics/rx_packets" ]]; then
+        rp1="$(cat "/sys/class/net/$iface/statistics/rx_packets")"
+        rb1="$(cat "/sys/class/net/$iface/statistics/rx_bytes")"
+        sleep "$win"
+        rp2="$(cat "/sys/class/net/$iface/statistics/rx_packets")"
+        rb2="$(cat "/sys/class/net/$iface/statistics/rx_bytes")"
+        pps=$(( (rp2 - rp1) / win ))
+        mbps=$(( (rb2 - rb1) * 8 / win / 1000000 ))
+        info "$iface: rx ${pps} пакетов/с (~${mbps} Мбит/с)"
+        # Средний пакет < 100 байт при заметном pps — почти наверняка флуд
+        # мелкими пакетами (SYN/UDP-амплификация), а не полезный трафик.
+        if [[ "$pps" -gt 1000 && "$(( (rb2 - rb1) / (rp2 - rp1 > 0 ? rp2 - rp1 : 1) ))" -lt 100 ]]; then
+            wrn "средний rx-пакет < 100 байт при ${pps} pps — профиль пакетного флуда, не полезной нагрузки"
+        fi
+    else
+        wrn "не удалось определить интерфейс по умолчанию"
+    fi
+
+    title "Вердикт"
+    local said=0
+    if [[ "${st_synrecv:-0}" -gt 500 && "${st_synrecv:-0}" -gt "${st_estab:-0}" ]]; then
+        bad "SYN-RECV (${st_synrecv}) выше ESTABLISHED (${st_estab}) — SYN-flood. Проверь ENABLE_SYNPROXY=1 и na-fw-panic on"
+        said=1
+    fi
+    if [[ "${uniqsrc:-0}" -gt 200 && "${top1:-0}" -lt 10 ]]; then
+        bad "флуд РАЗМАЗАН: ${uniqsrc} источников, максимум ${top1} соединений с каждого."
+        warn "  per-IP лимиты (в т.ч. na-fw-panic) здесь НЕ помогут — каждый IP по отдельности выглядит легитимным."
+        warn "  Работают: блоклисты/ASN (ENABLE_SCANNERS), ctguard (ENABLE_CTGUARD=1), защита у провайдера."
+        said=1
+    elif [[ "${top1:-0}" -ge 50 ]]; then
+        warn "флуд СКОНЦЕНТРИРОВАН (до ${top1} соединений с одного IP) — na-fw-panic on должен помочь; топ-IP выше можно забанить точечно"
+        said=1
+    fi
+    [[ "${pps:-0}" -gt 500000 ]] && { bad "rx ${pps} пакетов/с — вероятно упираемся в аплинк/PPS-потолок ДЦ; файрвол на ноде здесь бессилен, нужна защита провайдера"; said=1; }
+    [[ "$said" -eq 0 ]] && ok "признаков активной атаки не видно (соединения распределены нормально, SYN-RECV в норме)"
+    echo
+}
+if [[ "${1:-}" == "--attack" ]]; then shift; attack_shape "$@"; exit 0; fi
 
 clear 2>/dev/null || true
 printf "%b" "$BOLD"
@@ -527,6 +624,12 @@ if nft list table inet na_ctguard >/dev/null 2>&1; then
     [[ "${ENF:-0}" == 1 ]] && pass "ctguard ENFORCE активен (фантомов в блоке: $PH4)" \
         || info "ctguard в observe-режиме (только лог; NA_CTG_ENFORCE=1 для эвикта)"
 fi
+# panic — временный аварийный режим. Основной отчёт обязан о нём кричать: включённый
+# и забытый panic неотличим от «сервис необъяснимо тормозит у части клиентов».
+if nft list table inet na_panic >/dev/null 2>&1; then
+    bad "PANIC-РЕЖИМ АКТИВЕН ($(cat "$STATE_DIR/panic.on" 2>/dev/null)) — лимиты ужесточены, легитимные клиенты тоже режутся. Снять: na-fw-panic off"
+fi
+
 # synproxy degraded-маркер
 if [[ -f "$STATE_DIR/.synproxy-degraded" ]]; then
     bad "SYNPROXY DEGRADED: $(cat "$STATE_DIR/.synproxy-degraded") — защита без synproxy"

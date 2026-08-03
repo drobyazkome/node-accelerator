@@ -22,6 +22,8 @@
 #   WHITELIST="1.2.3.4,5.6.7.0/24"     IP/CIDR панели/мониторинга (v4 и v6)
 #   SYN_RATE=200  SYN_BURST=400        per-IP лимит новых TCP-конн./сек на сервисный порт
 #   UDP_RATE=200  UDP_BURST=400        per-IP лимит UDP пакетов/сек
+#   UDP_BULK_PORTS=443                  порты объёмного UDP (HY2/TUIC) — свой лимит
+#   UDP_BULK_RATE=50000 UDP_BULK_BURST=100000   per-IP лимит для них
 #   CONN_LIMIT=2048                    макс. одновременных конн. с одного IP (ct count)
 #   SSH_RATE=6    SSH_BURST=5          per-IP новых SSH/мин до бана
 #   SSH_BAN_TIME=24h  PORTSCAN_BAN_TIME=1h
@@ -71,6 +73,10 @@ NODE_PORT_LAST="${NODE_PORT_LAST:-}"    # кэш последнего удачн
 WHITELIST="${WHITELIST:-}"
 SYN_RATE="${SYN_RATE:-200}";  SYN_BURST="${SYN_BURST:-400}"
 UDP_RATE="${UDP_RATE:-200}";  UDP_BURST="${UDP_BURST:-400}"
+# Порты с легитимным объёмным UDP (Hysteria2/TUIC): общий UDP_RATE их душит,
+# поэтому у них отдельный, намного более высокий per-IP потолок.
+UDP_BULK_PORTS="${UDP_BULK_PORTS:-}"
+UDP_BULK_RATE="${UDP_BULK_RATE:-50000}"; UDP_BULK_BURST="${UDP_BULK_BURST:-100000}"
 # CONN_LIMIT — потолок ОДНОВРЕМЕННЫХ конн. с одного IP. За CGNAT (мобильные операторы,
 # частый кейс в RU/IR) один egress-IP агрегирует много абонентов → держим с большим
 # запасом, чтобы не рубить целые операторские пулы. Реальный VLESS-юзер — десятки конн.
@@ -229,7 +235,7 @@ _is_duration() { [[ "$1" =~ ^[0-9]+(s|m|h|d)?$ ]]; }
 # systemd-time (OnUnitActiveSec): один числовой терм с опц. словом-единицей. Уходит
 # в .timer-юнит → валидируем, чтобы непровалидированный ENV не дописал директив.
 _is_systime()  { [[ "$1" =~ ^[0-9]+(s|sec|m|min|h|hr|d|day)?$ ]]; }
-for _k in SYN_RATE SYN_BURST UDP_RATE UDP_BURST CONN_LIMIT ICMP_RATE ICMP_BURST \
+for _k in SYN_RATE SYN_BURST UDP_RATE UDP_BURST UDP_BULK_PORTS UDP_BULK_RATE UDP_BULK_BURST CONN_LIMIT ICMP_RATE ICMP_BURST \
           SSH_RATE SSH_BURST PORTSCAN_RATE PORTSCAN_BURST SAFETY_DELAY \
           NA_CTG_PHANTOM_MIN NA_CTG_LIVE_FLOOR NA_CTG_COARSE_MULT; do
     _is_uint "${!_k}" || { err "$_k='${!_k}' — ожидается целое число"; exit 1; }
@@ -560,10 +566,19 @@ done
 UDP_RULES=""
 for p in ${UDP_PORTS//,/ }; do
     [[ -z "$p" ]] && continue
+    # Порты из UDP_BULK_PORTS несут полезный объёмный трафик (Hysteria2/TUIC), а не
+    # запросы к сервису. Общий UDP_RATE=200 пакетов/с на IP — это потолок ~2 Мбит/с:
+    # живой HY2 упирается в него мгновенно, пакеты уходят в drop, и клиент видит то
+    # огромный пинг от ретрансмиссий, то N/A. Таким портам даём свой, высокий лимит:
+    # он всё ещё режет настоящий флуд, но не мешает нормальной работе.
+    local_rate="$UDP_RATE"; local_burst="$UDP_BURST"; _kind="анти-UDP-flood"
+    if [[ ",${UDP_BULK_PORTS}," == *",${p},"* ]]; then
+        local_rate="$UDP_BULK_RATE"; local_burst="$UDP_BULK_BURST"; _kind="объёмный UDP (HY2/TUIC)"
+    fi
     UDP_RULES+="
-        # порт ${p}/udp: per-IP rate (QUIC/Hysteria2/TUIC) — анти-UDP-flood
-        udp dport ${p} meter udp4_${p} { ip saddr limit rate ${UDP_RATE}/second burst ${UDP_BURST} packets } accept
-        udp dport ${p} meter udp6_${p} { ip6 saddr limit rate ${UDP_RATE}/second burst ${UDP_BURST} packets } accept
+        # порт ${p}/udp: per-IP rate — ${_kind}
+        udp dport ${p} meter udp4_${p} { ip saddr limit rate ${local_rate}/second burst ${local_burst} packets } accept
+        udp dport ${p} meter udp6_${p} { ip6 saddr limit rate ${local_rate}/second burst ${local_burst} packets } accept
         udp dport ${p} drop"
 done
 
@@ -1794,7 +1809,7 @@ EOF
 # восстанавливается по наличию fleet.env.
 save_conf "$CONF_DIR/protect.conf" \
     FW_MODE SSH_PORT TCP_PORTS UDP_PORTS NODE_PORT WHITELIST \
-    SYN_RATE SYN_BURST UDP_RATE UDP_BURST CONN_LIMIT \
+    SYN_RATE SYN_BURST UDP_RATE UDP_BURST UDP_BULK_PORTS UDP_BULK_RATE UDP_BULK_BURST CONN_LIMIT \
     ICMP_RATE ICMP_BURST SSH_RATE SSH_BURST SSH_BAN_TIME \
     PORTSCAN_BAN_TIME PORTSCAN_RATE PORTSCAN_BURST \
     ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC CROWDSEC_STRICT ENABLE_SYNPROXY \

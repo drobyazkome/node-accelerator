@@ -304,10 +304,17 @@ attack_shape() {
     # это ПО ЗАМЫСЛУ пиринговая нода, панель или upstream балансировщика, у которых
     # сотни соединений это норма. Без пометки такой пир читается как флуд, а его
     # бан или panic оборвал бы собственный транзит.
+    # Доверенных сетов ДВА: whitelist_* (задан оператором) и na_fleet_* (наполняет
+    # na-fleet-sync из панели). Оба принимаются в na_filter до всех лимитов, так что
+    # для вердикта они равнозначны. Проверка только whitelist_* объявляла бы каждую
+    # пиринговую ноду флота «не-whitelisted» — ровно та ложная тревога, ради которой
+    # эта пометка и вводилась.
     _iswl() {
         case "$1" in
-            *:*) nft get element inet na_filter whitelist_v6 "{ $1 }" >/dev/null 2>&1 ;;
-            *)   nft get element inet na_filter whitelist_v4 "{ $1 }" >/dev/null 2>&1 ;;
+            *:*) nft get element inet na_filter whitelist_v6 "{ $1 }" >/dev/null 2>&1 \
+              || nft get element inet na_filter na_fleet_v6  "{ $1 }" >/dev/null 2>&1 ;;
+            *)   nft get element inet na_filter whitelist_v4 "{ $1 }" >/dev/null 2>&1 \
+              || nft get element inet na_filter na_fleet_v4  "{ $1 }" >/dev/null 2>&1 ;;
         esac
     }
     local top1 uniqsrc top1x

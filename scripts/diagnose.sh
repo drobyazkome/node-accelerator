@@ -300,10 +300,31 @@ attack_shape() {
         ss -Htan state connected 2>/dev/null | awk '{print $5}' \
             | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff://'
     }
-    _peers | sort | uniq -c | sort -rn | head -15 | sed 's/^/    /'
+    # Whitelist-статус в той же строке: на bridge/CDN-топологии верхние строки —
+    # это ПО ЗАМЫСЛУ пиринговая нода, панель или upstream балансировщика, у которых
+    # сотни соединений это норма. Без пометки такой пир читается как флуд, а его
+    # бан или panic оборвал бы собственный транзит.
+    _iswl() {
+        case "$1" in
+            *:*) nft get element inet na_filter whitelist_v6 "{ $1 }" >/dev/null 2>&1 ;;
+            *)   nft get element inet na_filter whitelist_v4 "{ $1 }" >/dev/null 2>&1 ;;
+        esac
+    }
+    local top1 uniqsrc top1x
+    _peers | sort | uniq -c | sort -rn | head -15 | while read -r cnt ip; do
+        if _iswl "$ip"; then printf '    %7s %s  [whitelist]\n' "$cnt" "$ip"
+        else                 printf '    %7s %s\n' "$cnt" "$ip"; fi
+    done
     top1="$(_peers | sort | uniq -c | sort -rn | head -1 | awk '{print $1+0}')"
     uniqsrc="$(_peers | sort -u | wc -l)"
-    info "уникальных источников: ${uniqsrc}, максимум с одного IP: ${top1:-0}"
+    # top1x — максимум среди НЕ-whitelisted источников: только он и может быть атакой.
+    top1x=0
+    while read -r cnt ip; do
+        [[ -z "$ip" ]] && continue
+        _iswl "$ip" && continue
+        top1x="$cnt"; break
+    done < <(_peers | sort | uniq -c | sort -rn | head -30)
+    info "уникальных источников: ${uniqsrc}, максимум с одного IP: ${top1:-0} (не-whitelist: ${top1x:-0})"
 
     title "Дропы нашего файрвола"
     if nft list table inet na_filter >/dev/null 2>&1; then
@@ -347,14 +368,31 @@ attack_shape() {
         bad "SYN-RECV (${st_synrecv}) выше ESTABLISHED (${st_estab}) — SYN-flood. Проверь ENABLE_SYNPROXY=1 и na-fw-panic on"
         said=1
     fi
-    if [[ "${uniqsrc:-0}" -gt 200 && "${top1:-0}" -lt 10 ]]; then
-        bad "флуд РАЗМАЗАН: ${uniqsrc} источников, максимум ${top1} соединений с каждого."
+    if [[ "${uniqsrc:-0}" -gt 200 && "${top1x:-0}" -lt 10 ]]; then
+        bad "флуд РАЗМАЗАН: ${uniqsrc} источников, максимум ${top1x} соединений с каждого."
         warn "  per-IP лимиты (в т.ч. na-fw-panic) здесь НЕ помогут — каждый IP по отдельности выглядит легитимным."
         warn "  Работают: блоклисты/ASN (ENABLE_SCANNERS), ctguard (ENABLE_CTGUARD=1), защита у провайдера."
         said=1
-    elif [[ "${top1:-0}" -ge 50 ]]; then
-        warn "флуд СКОНЦЕНТРИРОВАН (до ${top1} соединений с одного IP) — na-fw-panic on должен помочь; топ-IP выше можно забанить точечно"
+    elif [[ "${top1x:-0}" -ge 50 ]]; then
+        # Сознательно НЕ называем это флудом: на bridge/CDN-нодах ровно так же
+        # выглядит легитимный upstream, который просто забыли внести в WHITELIST.
+        # Диагностика говорит, что видит, и даёт обе ветки — решает оператор.
+        wrn "концентрация: до ${top1x} соединений с одного НЕ-whitelisted IP (список выше)"
+        info "  свой балансировщик/CDN/пиринговая нода? → в WHITELIST= (иначе его режут per-IP лимиты)"
+        info "  чужой? → кандидат на бан, na-fw-panic on поможет"
         said=1
+    elif [[ "${top1:-0}" -ge 50 ]]; then
+        ok "верхние источники (до ${top1} соединений) — в whitelist: для bridge/CDN-топологии это норма, не атака"
+        said=1
+    fi
+    # Отдельная ловушка: panic делит CONN_LIMIT на 4, а whitelist в na_panic
+    # принимается ДО лимитов. Значит опасен только не-whitelisted пир — если он
+    # легитимный и уже близко к ужесточённому потолку, panic оборвёт его первым.
+    if [[ "${top1x:-0}" -ge 50 ]]; then
+        local _cl; _cl="$(awk -F'=' '/CONN_LIMIT/{gsub(/[^0-9]/,"",$2); print $2}' /etc/node-accelerator/protect.conf 2>/dev/null | head -1)"
+        if [[ -n "${_cl:-}" && "${top1x}" -ge $(( _cl / 4 )) ]]; then
+            wrn "  ⚠ при panic (CONN_LIMIT ${_cl}→$(( _cl / 4 ))) этот источник будет обрезан — внеси в WHITELIST, если он свой"
+        fi
     fi
     [[ "${pps:-0}" -gt 500000 ]] && { bad "rx ${pps} пакетов/с — вероятно упираемся в аплинк/PPS-потолок ДЦ; файрвол на ноде здесь бессилен, нужна защита провайдера"; said=1; }
     [[ "$said" -eq 0 ]] && ok "признаков активной атаки не видно (соединения распределены нормально, SYN-RECV в норме)"

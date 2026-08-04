@@ -224,6 +224,8 @@ validate_port_list "$SSH_PORT" SSH_PORT || exit 1
 [[ "$NODE_PORT" == "auto" ]] || validate_port_list "$NODE_PORT" NODE_PORT || exit 1
 validate_port_list "$TCP_PORTS" TCP_PORTS || exit 1
 validate_port_list "$UDP_PORTS" UDP_PORTS || exit 1
+# Пустой = класса объёмного UDP нет (нода без Hysteria2/TUIC) — это норма, не ошибка.
+[[ -z "$UDP_BULK_PORTS" ]] || validate_port_list "$UDP_BULK_PORTS" UDP_BULK_PORTS || exit 1
 # кэш прошлого детекта приходит из conf — битый молча сбрасываем (уйдёт в nft-ruleset)
 validate_port_list "$NODE_PORT_LAST" NODE_PORT_LAST 2>/dev/null || NODE_PORT_LAST=""
 
@@ -235,7 +237,10 @@ _is_duration() { [[ "$1" =~ ^[0-9]+(s|m|h|d)?$ ]]; }
 # systemd-time (OnUnitActiveSec): один числовой терм с опц. словом-единицей. Уходит
 # в .timer-юнит → валидируем, чтобы непровалидированный ENV не дописал директив.
 _is_systime()  { [[ "$1" =~ ^[0-9]+(s|sec|m|min|h|hr|d|day)?$ ]]; }
-for _k in SYN_RATE SYN_BURST UDP_RATE UDP_BURST UDP_BULK_PORTS UDP_BULK_RATE UDP_BULK_BURST CONN_LIMIT ICMP_RATE ICMP_BURST \
+# UDP_BULK_PORTS сюда НЕ входит: это список портов ("443" или "443,8443"), а не
+# число, и по умолчанию он пуст. В числовом цикле он валил ре-ран на любой ноде
+# без Hysteria2 ещё до генерации правил. Порты проверяются своей валидацией ниже.
+for _k in SYN_RATE SYN_BURST UDP_RATE UDP_BURST UDP_BULK_RATE UDP_BULK_BURST CONN_LIMIT ICMP_RATE ICMP_BURST \
           SSH_RATE SSH_BURST PORTSCAN_RATE PORTSCAN_BURST SAFETY_DELAY \
           NA_CTG_PHANTOM_MIN NA_CTG_LIVE_FLOOR NA_CTG_COARSE_MULT; do
     _is_uint "${!_k}" || { err "$_k='${!_k}' — ожидается целое число"; exit 1; }

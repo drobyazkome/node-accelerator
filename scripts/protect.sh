@@ -1448,6 +1448,36 @@ covers_protected() {
     return 1
 }
 
+int2ip() { local i="$1"; echo "$(( (i>>24)&255 )).$(( (i>>16)&255 )).$(( (i>>8)&255 )).$(( i&255 ))"; }
+# Префикс, накрывающий protected-адрес, раньше выбрасывался целиком. Если наша нода
+# стоит в сети, откуда реально сканируют (ruvds: 45.10.246.0/24), это отдавало всю
+# сеть ради одного своего /32. Теперь вырезаем дырку и берём остаток интервалами.
+# Только /24 и уже: у широких сетей цена ошибки выше, они по-прежнему отбрасываются.
+split_protected() {
+    local cidr="$1" net len m start end p pi cur
+    net="${cidr%/*}"; len="${cidr#*/}"
+    [ "$len" -ge 24 ] 2>/dev/null || return 1
+    m=$(( (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+    start=$(( $(ip2int "$net") & m ))
+    end=$(( start + (0xFFFFFFFF & ~m) ))
+    cur=$start
+    while read -r p; do
+        [ -n "$p" ] || continue
+        pi=$(ip2int "$p")
+        [ "$pi" -ge "$start" ] && [ "$pi" -le "$end" ] || continue
+        if [ "$pi" -gt "$cur" ]; then
+            if [ $(( pi - 1 )) -eq "$cur" ]; then printf '%s\n' "$(int2ip "$cur")"
+            else printf '%s-%s\n' "$(int2ip "$cur")" "$(int2ip $(( pi - 1 )))"; fi
+        fi
+        cur=$(( pi + 1 ))
+    done < <(sort -t. -k1,1n -k2,2n -k3,3n -k4,4n "$TMP/protected")
+    if [ "$cur" -le "$end" ]; then
+        if [ "$cur" -eq "$end" ]; then printf '%s\n' "$(int2ip "$cur")"
+        else printf '%s-%s\n' "$(int2ip "$cur")" "$(int2ip "$end")"; fi
+    fi
+    return 0
+}
+
 # ── ASN → префиксы ───────────────────────────────────────────────────────────
 _ripestat_v4() {
     command -v jq >/dev/null 2>&1 || return 1
@@ -1502,7 +1532,7 @@ fi
 [ -r "$CUSTOM" ] && grep -vE '^\s*#|^\s*$' "$CUSTOM" >> "$TMP/v4.raw"
 
 # ── фильтрация ───────────────────────────────────────────────────────────────
-n_wide=0; n_prot=0
+n_wide=0; n_prot=0; n_split=0
 : > "$TMP/v4.clean"
 while read -r c; do
     [ -n "$c" ] || continue
@@ -1510,6 +1540,11 @@ while read -r c; do
     [ "$len" -ge "$MIN_PREFIXLEN" ] 2>/dev/null || { n_wide=$((n_wide+1)); continue; }
     case "$c" in 0.*|10.*|127.*|169.254.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*|22[4-9].*|23[0-9].*|24[0-9].*|25[0-5].*) continue ;; esac
     if [ "$NPROT" -gt 0 ] && covers_protected "$c"; then
+        if holes="$(split_protected "$c")" && [ -n "$holes" ]; then
+            logger -t "$TAG" "префикс $c накрывает свой/панельный/флотовый адрес — вырезаны его /32, остаток взят"
+            printf '%s\n' "$holes" >> "$TMP/v4.clean"
+            n_split=$((n_split+1)); continue
+        fi
         logger -t "$TAG" "префикс $c накрывает свой/панельный/флотовый адрес — ОТБРОШЕН"
         n_prot=$((n_prot+1)); continue
     fi
@@ -1536,7 +1571,7 @@ if nft -f "$TMP/sc.nft" 2>/dev/null; then
     # это оказалось ~12 минут полностью без блоклиста. na-scanner-restore.service
     # заливает этот файл сразу после na-firewall, ещё до появления сети наружу.
     cp -f "$TMP/sc.nft" /var/lib/node-accelerator/scanner-cache.nft 2>/dev/null || true
-    logger -t "$TAG" "scanner обновлён: ${N4} v4 + ${N6} v6 (ASN=${n_asn}, ASN-пропущено=${n_skip}, фид-строк=${n_feed}, широких=${n_wide}, защищённых=${n_prot})"
+    logger -t "$TAG" "scanner обновлён: ${N4} v4 + ${N6} v6 (ASN=${n_asn}, ASN-пропущено=${n_skip}, фид-строк=${n_feed}, широких=${n_wide}, защищённых=${n_prot}, с-дыркой=${n_split})"
 else
     logger -t "$TAG" "nft apply не прошёл — last-known-good"
 fi

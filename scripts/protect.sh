@@ -1205,17 +1205,26 @@ done < "$TMP/addr"
 V4="$(grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' "$TMP/v4" 2>/dev/null | sort -u | paste -sd, -)"
 V6="$(grep -E '^[0-9a-fA-F:]+$' "$TMP/v6" 2>/dev/null | grep ':' | sort -u | paste -sd, -)"
 [ -n "$V4" ] || [ -n "$V6" ] || { logger -t "$TAG" "0 валидных IP — last-known-good"; exit 0; }
+# na_fleet_v6 is not declared everywhere: a node whose na_filter.nft predates the
+# set simply has no v6 sibling. `nft -f` is atomic, so one flush of a missing set
+# takes the WHOLE transaction down with it, v4 included — the sync then logs
+# "nft apply не прошёл" every run and the fleet list stays frozen forever. The v4
+# side already guards for this above (and exits 0); the v6 side did not.
+HAVE_V6=0
+nft list set inet na_filter na_fleet_v6 >/dev/null 2>&1 && HAVE_V6=1
 {
     echo "flush set inet na_filter na_fleet_v4"
     [ -n "$V4" ] && echo "add element inet na_filter na_fleet_v4 { $V4 }"
-    echo "flush set inet na_filter na_fleet_v6"
-    [ -n "$V6" ] && echo "add element inet na_filter na_fleet_v6 { $V6 }"
+    if [ "$HAVE_V6" = 1 ]; then
+        echo "flush set inet na_filter na_fleet_v6"
+        [ -n "$V6" ] && echo "add element inet na_filter na_fleet_v6 { $V6 }"
+    fi
 } > "$TMP/upd.nft"
 n4=$(printf '%s' "$V4" | tr ',' '\n' | grep -c . || true)
 n6=$(printf '%s' "$V6" | tr ',' '\n' | grep -c . || true)
 if nft -f "$TMP/upd.nft" 2>/dev/null; then
     mkdir -p /var/lib/node-accelerator && date +%s > "$STAMP"
-    logger -t "$TAG" "whitelist нод обновлён: ${n4} v4 + ${n6} v6 (из $(redact_url "$SRC"))"
+    logger -t "$TAG" "whitelist нод обновлён: ${n4} v4 + $([ "$HAVE_V6" = 1 ] && echo "${n6} v6" || echo "v6 сета нет") (из $(redact_url "$SRC"))"
 else
     logger -t "$TAG" "nft apply не прошёл — last-known-good сохранён"
 fi

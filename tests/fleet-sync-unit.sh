@@ -119,5 +119,41 @@ bash "$T/na-fleet-sync"
 [ ! -f "$REC/nft.applied" ]; check $? "при HTTP 503 nft-транзакция не выполняется"
 grep -qF 'last-known-good' "$REC/logger.out"; check $? "в лог ушёл fail-safe last-known-good"
 
+# ── Кейс 4: сета na_fleet_v6 на узле нет ───────────────────────────────────────
+# nft -f атомарен: flush несуществующего сета ронял ВСЮ транзакцию вместе с v4,
+# и синк молча писал "nft apply не прошёл" каждый запуск, а список нод оставался
+# замороженным. Поймано 28.08 на двух узлах, чей na_filter.nft старше набора v6.
+echo "== узел без na_fleet_v6 → v4 всё равно применяется =="
+rm -f "$REC"/curl.* "$REC"/logger.out "$REC"/nft.applied
+printf '{"response":[{"address":"203.0.113.10"},{"address":"203.0.113.11"},{"address":"2001:db8::42"}]}\n' > "$REC/fixture-nodes.json"
+cat > "$T/bin/curl" <<'CURL4'
+#!/bin/sh
+OUT=""
+while [ $# -gt 0 ]; do
+    case "$1" in -o) OUT="$2"; shift;; esac
+    shift
+done
+[ -n "$OUT" ] && cp "$REC/fixture-nodes.json" "$OUT"
+printf '200'
+exit 0
+CURL4
+chmod +x "$T/bin/curl"
+# nft: v4 есть, v6 нет; -f падает, если в транзакции упомянут v6
+cat > "$T/bin/nft" <<'NFT4'
+#!/bin/sh
+case "$1" in
+    list) case "$*" in *na_fleet_v6*) exit 1;; *) exit 0;; esac;;
+    -f)   if grep -q na_fleet_v6 "$2"; then exit 1; fi
+          cat "$2" >> "$REC/nft.applied"; exit 0;;
+esac
+exit 0
+NFT4
+chmod +x "$T/bin/nft"
+bash "$T/na-fleet-sync"
+[ -f "$REC/nft.applied" ]; check $? "транзакция применилась, несмотря на отсутствие v6"
+grep -qF '203.0.113.10' "$REC/nft.applied"; check $? "адреса v4 доехали"
+nocontain "$REC/nft.applied" 'na_fleet_v6'; check $? "v6 не упомянут в транзакции"
+nocontain "$REC/logger.out" 'nft apply не прошёл'; check $? "нет ложного отказа в логе"
+
 if [ "$fail" -ne 0 ]; then echo "FLEET-SYNC-UNIT: FAIL"; exit 1; fi
 echo "FLEET-SYNC-UNIT: OK (секреты не в argv, уходят через -H @file, URL в логе без userinfo, редиректы заблокированы, парсинг адресов и fail-safe работают)"

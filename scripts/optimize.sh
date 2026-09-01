@@ -747,10 +747,13 @@ LRC
     backup_file "$LR_CONF" "$BACKUP"
     _na_lr_write
 
+    _lrout=""
     if command -v logrotate >/dev/null 2>&1; then
         while [[ "${#_want[@]}" -gt 0 ]]; do
-            _dupf="$({ logrotate -d /etc/logrotate.conf 2>&1 || true; } \
-                     | sed -n 's/.*duplicate log entry for //p' | sort -u)"
+            # вывод сохраняем: по нему же ниже проверяем ошибки чужих станс,
+            # чтобы не звать logrotate второй раз
+            _lrout="$({ logrotate -d /etc/logrotate.conf 2>&1 || true; })"
+            _dupf="$(printf '%s\n' "$_lrout" | sed -n 's/.*duplicate log entry for //p' | sort -u)"
             [[ -n "$_dupf" ]] || break
             _keep=()
             for _m in "${_want[@]}"; do
@@ -781,6 +784,22 @@ LRC
     for _m in "${_dup[@]}"; do
         warn "маска $_m уже покрыта чужой стансой в /etc/logrotate.d — отдана ей; проверь, что там задан maxsize"
     done
+
+    # Любая ЧУЖАЯ битая станса роняет весь прогон: logrotate печатает `error:`,
+    # пропускает её и выходит с ненулевым кодом. Юнит ниже — Type=oneshot, значит
+    # он будет уходить в failed каждый час при внешне здоровом таймере, а причина
+    # лежит в файле, к которому мы отношения не имеем. Арбитраж выше ловит только
+    # `duplicate log entry`, поэтому сюда доедут все остальные ошибки — например
+    # станса, записанная в одну строку: `bad rotation count '3 missingok … }'`.
+    # Не чиним чужое молча: печатаем ровно ту строку, которую покажет logrotate.
+    if [[ -n "$_lrout" ]]; then
+        _lrerr="$(printf '%s\n' "$_lrout" | grep -iE '^error' | head -3 || true)"
+        if [[ -n "$_lrerr" ]]; then
+            warn "logrotate спотыкается на чужой стансе — na-logrotate.service будет падать в failed:"
+            while IFS= read -r _l; do [[ -n "$_l" ]] && warn "  $_l"; done <<<"$_lrerr"
+            warn "  чинить: logrotate -d /etc/logrotate.conf, затем поправить файл в /etc/logrotate.d"
+        fi
+    fi
 
     cat > /etc/systemd/system/na-logrotate.service <<'EOF'
 [Unit]

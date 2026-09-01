@@ -884,8 +884,17 @@ elif systemctl is-active --quiet na-logrotate.timer 2>/dev/null; then
 else
     info "часовой таймер ротации не активен — работает только суточный logrotate.timer (maxsize проверяется раз в сутки)"
 fi
-if command -v logrotate >/dev/null 2>&1 && logrotate -d /etc/logrotate.conf 2>&1 | grep -qi 'duplicate log entry'; then
-    wrn "logrotate: дубликат путей — часть станс пропускается целиком (logrotate -d /etc/logrotate.conf)"
+# Ловим ЛЮБУЮ ошибку прогона, а не только дубликаты путей. Каждая из них
+# пропускает стансу целиком и возвращает ненулевой код, то есть na-logrotate.service
+# (Type=oneshot) уходит в failed при живом таймере. Классика — станса, записанная
+# в одну строку: `bad rotation count '3 missingok notifempty copytruncate }'`.
+if command -v logrotate >/dev/null 2>&1; then
+    LRERR="$( { logrotate -d /etc/logrotate.conf 2>&1 || true; } | grep -iE '^error' | head -1)"
+    if [[ -n "$LRERR" ]]; then
+        wrn "logrotate: $LRERR — станса пропускается, na-logrotate.service уйдёт в failed"
+    else
+        pass "logrotate: весь набор станс разбирается без ошибок"
+    fi
 fi
 # Инциденты ядра/сервисов
 OOM="$(journalctl -k --since '-24h' --no-pager 2>/dev/null | grep -ciE 'out of memory|oom-killer|soft lockup|hung task')"

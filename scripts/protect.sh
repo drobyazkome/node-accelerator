@@ -586,11 +586,21 @@ for p in ${UDP_PORTS//,/ }; do
     if [[ ",${UDP_BULK_PORTS}," == *",${p},"* ]]; then
         _urate="$UDP_BULK_RATE"; _uburst="$UDP_BULK_BURST"; _ukind="объёмный туннель, высокий потолок"
     fi
+    # Дроп по UDP был НЕМЫМ: ни счётчика, ни лога. У TCP превышение видно в
+    # [na synflood], а тут единственным признаком упёршегося потолка оставалась
+    # жалоба клиента — «огромный пинг» или N/A на хосте, ровно тот случай, ради
+    # которого заведён UDP_BULK_PORTS. Счётчик стоит ноль и отвечает на вопрос
+    # «потолок вообще срабатывает?», лог с префиксом [na udpflood] несёт SRC= и
+    # потому попадает в форензику na-report наравне с остальными причинами.
+    # 1/minute, а не 5/second как у TCP: UDP-флуд на порядки объёмнее, и лог
+    # такой частоты сам стал бы флудом (на флоте kern.log и так растёт на
+    # сотни МБ от [na portscan]).
     UDP_RULES+="
         # порт ${p}/udp: per-IP rate (QUIC/Hysteria2/TUIC) — ${_ukind}
         udp dport ${p} meter udp4_${p} { ip saddr limit rate ${_urate}/second burst ${_uburst} packets } accept
         udp dport ${p} meter udp6_${p} { ip6 saddr limit rate ${_urate}/second burst ${_uburst} packets } accept
-        udp dport ${p} drop"
+        udp dport ${p} limit rate 1/minute log prefix \"[na udpflood] \" level info
+        udp dport ${p} counter drop"
 done
 # Порт в bulk-списке, но не в UDP_PORTS — правило для него не сгенерится вообще: молчать нельзя.
 for p in ${UDP_BULK_PORTS//,/ }; do
@@ -2046,12 +2056,12 @@ chmod +x /usr/local/sbin/na-fw-panic
 
 # ─── просмотр срабатываний файрвола ──────────────────────────────────────────
 # Правила пишут в kernel log с префиксами [na synflood]/[na portscan]/
-# [na ssh-flood]/[na badflags]/[na panic]. Под атакой смотреть их голым
+# [na ssh-flood]/[na udpflood]/[na badflags]/[na panic]. Под атакой смотреть их голым
 # journalctl -k неудобно: нужен фильтр по IP или порту, а поля лежат внутри
 # строки (SRC=..., DPT=...), не в journald-полях.
 cat > /usr/local/sbin/na-fw-logs <<'FWLOG'
 #!/usr/bin/env bash
-# na-fw-logs [-f] [--lines=N] [--ip=IP] [--port=PORT] [--kind=synflood|portscan|ssh-flood|badflags|panic]
+# na-fw-logs [-f] [--lines=N] [--ip=IP] [--port=PORT] [--kind=synflood|portscan|ssh-flood|udpflood|badflags|panic]
 #            [--panic] [--top]
 #
 # Читает срабатывания правил na_filter/na_panic из kernel log.

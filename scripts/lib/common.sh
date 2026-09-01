@@ -6,7 +6,7 @@
 # Версия тулкита — ЕДИНСТВЕННЫЙ источник. Пишется в installed-маркеры и отдаётся
 # в na-diagnose/na-report --json, чтобы флот-мониторинг видел version-drift по нодам.
 # shellcheck disable=SC2034
-NA_VERSION="4.0.2-rw1"
+NA_VERSION="4.0.3-rw1"
 
 # shellcheck disable=SC2034
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'

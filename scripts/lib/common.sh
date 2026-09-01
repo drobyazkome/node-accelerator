@@ -6,7 +6,7 @@
 # Версия тулкита — ЕДИНСТВЕННЫЙ источник. Пишется в installed-маркеры и отдаётся
 # в na-diagnose/na-report --json, чтобы флот-мониторинг видел version-drift по нодам.
 # shellcheck disable=SC2034
-NA_VERSION="3.9.9"
+NA_VERSION="4.0.1-rw1"
 
 # shellcheck disable=SC2034
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -108,7 +108,14 @@ backup_dir() {
     mkdir -p "$d"
     echo "$d"
 }
-backup_file() { [[ -f "$1" ]] && cp -a "$1" "$2/"; return 0; }
+# ${2:?}: одноаргументный вызов обязан падать сразу и с внятным текстом — а не
+# «$2: unbound variable» из глубины, и только на ре-ране, когда файл впервые
+# существует и [[ -f ]] перестаёт коротить цепочку (issue #24).
+backup_file() {
+    local dst="${2:?backup_file: нужен каталог назначения}"
+    [[ -f "$1" ]] && cp -a "$1" "$dst/"
+    return 0
+}
 
 apt_install() {
     export DEBIAN_FRONTEND=noninteractive

@@ -41,7 +41,8 @@ emit_json() {
     uln="$(ulimit -n 2>/dev/null || echo 0)"; [[ "$uln" =~ ^[0-9]+$ ]] || uln=0   # RLIMIT=infinity → "unlimited" сломал бы JSON-число
     minsnd="$(val net.ipv4.tcp_min_snd_mss)"; minsnd="${minsnd:-0}"
     mtuprobe="$(val net.ipv4.tcp_mtu_probing)"; mtuprobe="${mtuprobe:-0}"
-    collapsed="$(ss -tin 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
+    # только established: отмирающие сокеты (TIME-WAIT и пр.) давали ложный «коллапс»
+    collapsed="$(ss -tin state established 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
     # CPU steal (1с-сэмпл) — только если есть /proc/stat
     steal=0
     if [[ -r /proc/stat ]]; then
@@ -134,6 +135,16 @@ emit_json() {
         done
     fi
 
+    # Диск, inodes и лог-флуд: в человекочитаемом выводе они были, а во флот-мониторинге —
+    # нет, поэтому самая частая авария (диск под завязку от нертотируемого лога) была не
+    # видна снаружи вообще, пока нода не замолкала.
+    dsp="$(df -P / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')"; [[ "$dsp" =~ ^[0-9]+$ ]] || dsp=0
+    din="$(df -Pi / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')"; [[ "$din" =~ ^[0-9]+$ ]] || din=0
+    logmax="$(find /var/log -xdev -type f -printf '%s\n' 2>/dev/null | sort -rn | head -1)"; [[ "$logmax" =~ ^[0-9]+$ ]] || logmax=0
+    dklogmax="$(find /var/lib/docker/containers -xdev -type f -name '*-json.log' -printf '%s\n' 2>/dev/null | sort -rn | head -1)"
+    [[ "$dklogmax" =~ ^[0-9]+$ ]] || dklogmax=0
+    lrt=0; systemctl is-active --quiet na-logrotate.timer 2>/dev/null && lrt=1
+
     printf '{'
     printf '"kernel":"%s","xanmod":%s,"virt":"%s","cpu_steal_pct":%s,"tcp_retrans_pct":%s,' "$kern" "$xanmod" "$virt" "$steal" "$rtxpct"
     printf '"congestion_control":"%s","qdisc":"%s","conntrack_max":%s,"conntrack_count":%s,"conntrack_pct":%s,' "${cc:-}" "${qd:-}" "$ctmax" "$ctcnt" "$ctpct"
@@ -145,7 +156,9 @@ emit_json() {
     printf '"wan_iface":"%s","wan_rx_bytes":%s,"wan_tx_bytes":%s,"ipv6_default":%s,"udp_rcvbuf_errors":%s,' "$wi" "$wanrx" "$wantx" "$ip6def" "$udperr"
     printf '"remnanode_status":"%s","remnanode_restarts":%s,"remnanode_spawn_errors_1h":%s,' "$rnst" "$rnrc" "$rnse"
     printf '"node_port_detected":"%s","node_port_fw":"%s",' "$npd" "$npfw"
-    printf '"fleet_sync_age_s":%s,"blocklist_age_s":%s,"cert_min_days":%s}\n' "$fsa" "$bla" "$certd"
+    printf '"fleet_sync_age_s":%s,"blocklist_age_s":%s,"cert_min_days":%s,' "$fsa" "$bla" "$certd"
+    printf '"disk_pct":%s,"inode_pct":%s,"log_max_bytes":%s,"docker_log_max_bytes":%s,"logrotate_timer":%s}\n' \
+        "$dsp" "$din" "$logmax" "$dklogmax" "$lrt"
 }
 if [[ "${1:-}" == "--json" ]]; then emit_json; exit 0; fi
 
@@ -542,11 +555,22 @@ MTUPROBE="$(val net.ipv4.tcp_mtu_probing)"
 if [[ "${MINSND:-0}" -ge 512 ]] 2>/dev/null; then pass "tcp_min_snd_mss = $MINSND (пол против коллапса)"
 else wrn "tcp_min_snd_mss = ${MINSND:-?} (при mtu_probing=1 рекоменд. ≥512 — иначе MSS-коллапс)"; fi
 [[ -n "$MTUPROBE" ]] && info "tcp_mtu_probing = $MTUPROBE"
-COLLAPSED="$(ss -tin 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
-if [[ "${COLLAPSED:-0}" -gt 0 ]]; then
-    bad "живых сокетов с обрезанным MSS (<256): $COLLAPSED — ИДЁТ MSS-коллапс на лоссовом плече (см. tcp_min_snd_mss)"
-else
+# Считаем ТОЛЬКО established. Без фильтра состояния сюда попадали отмирающие сокеты
+# (TIME-WAIT, FIN-WAIT, LAST-ACK), которых на ноде сотни, и одного такого хватало, чтобы
+# объявить коллапс на совершенно здоровой ноде. И смотрим долю: единичный пир с маленьким
+# MSS — это его канал, а не наша беда. Настоящий коллапс — это когда пол опущен
+# (min_snd_mss мал) или просели сразу многие соединения.
+COLLAPSED="$(ss -tin state established 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
+EST_TOTAL="$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
+[[ "${EST_TOTAL:-0}" =~ ^[0-9]+$ ]] || EST_TOTAL=0
+if [[ "${COLLAPSED:-0}" -eq 0 ]]; then
     pass "сокетов с обрезанным MSS нет (коллапса не видно)"
+elif [[ "${MINSND:-0}" -lt 512 ]]; then
+    bad "established с обрезанным MSS (<256): $COLLAPSED из ${EST_TOTAL} при поле min_snd_mss=${MINSND:-?} — ИДЁТ MSS-коллапс (подними пол до 512)"
+elif [[ "$EST_TOTAL" -gt 0 && $((COLLAPSED * 100 / EST_TOTAL)) -ge 5 && "$COLLAPSED" -ge 3 ]]; then
+    bad "established с обрезанным MSS (<256): $COLLAPSED из ${EST_TOTAL} — просела заметная доля соединений (лоссовое плечо; см. tcp_mtu_probing)"
+else
+    info "established с обрезанным MSS (<256): $COLLAPSED из ${EST_TOTAL} — единичные пиры с узким каналом, пол 512 держит"
 fi
 
 # ─── NIC / RPS ───────────────────────────────────────────────────────────────
@@ -606,6 +630,21 @@ if nft list table inet na_filter >/dev/null 2>&1; then
     WL6N=$(nft list set inet na_filter whitelist_v6 2>/dev/null | grep -c ':')
     if [[ "$WLN" -gt 0 || "$WL6N" -gt 0 ]]; then pass "whitelist: v4=$WLN v6=$WL6N адрес(ов)"
     else wrn "whitelist пуст — твой IP не защищён от автобана!"; fi
+    # Дрейф живого сета от файла. Адреса, добавленные на ходу через `nft add element`,
+    # существуют только в памяти ядра: при загрузке правила берутся из na_filter.nft, и
+    # ре-ран protect или ребут молча их выбрасывает. Отсюда классическая авария — нода
+    # исправна и доступна, а после перезагрузки панель до неё не достучалась.
+    NFT_FILE="$CONF_DIR/na_filter.nft"
+    if [[ -r "$NFT_FILE" ]]; then
+        LIVE_WL="$(nft list set inet na_filter whitelist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u)"
+        FILE_WL="$(awk '/set whitelist_v4/,/}/' "$NFT_FILE" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u)"
+        DRIFT="$(comm -23 <(printf '%s\n' "$LIVE_WL") <(printf '%s\n' "$FILE_WL") 2>/dev/null | grep -c .)"
+        if [[ "${DRIFT:-0}" -gt 0 ]]; then
+            wrn "в живом whitelist_v4 на $DRIFT адрес(ов) больше, чем в $NFT_FILE — они пропадут при ре-ране/ребуте: $(comm -23 <(printf '%s\n' "$LIVE_WL") <(printf '%s\n' "$FILE_WL") 2>/dev/null | paste -sd' ' -)"
+        else
+            pass "whitelist в файле и в памяти совпадают (переживёт ребут)"
+        fi
+    fi
     # датчик: насколько близко самый «жирный» источник к CONN_LIMIT (виден ли per-IP потолок)
     CLIM=$(nft list chain inet na_filter input 2>/dev/null | grep -oE 'ct count over [0-9]+' | head -1 | grep -oE '[0-9]+')
     if [[ -n "$CLIM" ]]; then
@@ -823,6 +862,31 @@ DSP="$(df -P / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')"
 DIN="$(df -Pi / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')"
 if [[ "${DSP:-0}" -ge 85 ]] 2>/dev/null; then wrn "/ занят на ${DSP}%"; else info "/ занят на ${DSP:-?}%"; fi
 if [[ "${DIN:-0}" -ge 85 ]] 2>/dev/null; then wrn "inodes / заняты на ${DIN}% (лог-флуд?)"; else info "inodes /: ${DIN:-?}%"; fi
+
+# Лог-флуд. Процент диска — слишком поздний сигнал: он спокоен, пока один access.log
+# растёт на сотни МБ в сутки, а на маленьком диске это упирается в 100% за недели. Диск
+# на 100% выглядит тише, чем есть: контейнеры перестают писать логи (нода становится
+# ненаблюдаемой), а acme.sh не может обновить сертификат.
+LOGBIG="$(find /var/log -xdev -type f -size +500M -printf '%s %p\n' 2>/dev/null | sort -rn | head -1)"
+if [[ -n "$LOGBIG" ]]; then
+    wrn "крупный лог: $(awk '{printf "%.1f ГБ  %s", $1/1073741824, $2}' <<<"$LOGBIG") — ротация не поспевает"
+else
+    pass "файлов >500 МБ в /var/log нет"
+fi
+# Логи контейнеров живут вне /var/log, и logrotate их не видит вообще: кап задаётся
+# только в /etc/docker/daemon.json (log-opts max-size) и лишь для НОВЫХ контейнеров.
+DKBIG="$(find /var/lib/docker/containers -xdev -type f -name '*-json.log' -size +200M -printf '%s %p\n' 2>/dev/null | sort -rn | head -1)"
+[[ -n "$DKBIG" ]] && wrn "json-лог контейнера: $(awk '{printf "%.1f ГБ", $1/1073741824}' <<<"$DKBIG") — задай log-opts max-size в /etc/docker/daemon.json"
+if ! command -v logrotate >/dev/null 2>&1; then
+    wrn "logrotate не установлен — стансы в /etc/logrotate.d не выполняются вообще"
+elif systemctl is-active --quiet na-logrotate.timer 2>/dev/null; then
+    pass "ротация логов: часовой таймер активен"
+else
+    info "часовой таймер ротации не активен — работает только суточный logrotate.timer (maxsize проверяется раз в сутки)"
+fi
+if command -v logrotate >/dev/null 2>&1 && logrotate -d /etc/logrotate.conf 2>&1 | grep -qi 'duplicate log entry'; then
+    wrn "logrotate: дубликат путей — часть станс пропускается целиком (logrotate -d /etc/logrotate.conf)"
+fi
 # Инциденты ядра/сервисов
 OOM="$(journalctl -k --since '-24h' --no-pager 2>/dev/null | grep -ciE 'out of memory|oom-killer|soft lockup|hung task')"
 if [[ "${OOM:-0}" -gt 0 ]]; then wrn "kern-лог за 24ч: $OOM строк OOM/lockup/hung — память/перегруз"; else pass "kern-лог чист (OOM/lockup/hung за 24ч нет)"; fi

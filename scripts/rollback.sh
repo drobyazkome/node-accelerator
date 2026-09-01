@@ -35,6 +35,13 @@ rollback_optimize() {
     done
     rm -f /usr/local/sbin/na-rps-setup /usr/local/sbin/na-zram-setup
 
+    # Ротация логов: свой таймер и своя станса. Уже сжатые/повёрнутые файлы не трогаем —
+    # это данные оператора, а не наш артефакт.
+    systemctl disable --now na-logrotate.timer   >/dev/null 2>&1 || true
+    systemctl disable --now na-logrotate.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/na-logrotate.timer /etc/systemd/system/na-logrotate.service
+    rm -f /etc/logrotate.d/na-node-logs
+
     # /swapfile снимаем ТОЛЬКО если его создали мы (метка swapfile.created) — чужой swap
     # трогать нельзя, а снятие живого swap'а на нагруженной ноде это прямой путь к OOM.
     if [[ -f "$STATE_DIR/swapfile.created" ]]; then

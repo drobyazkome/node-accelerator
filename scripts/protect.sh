@@ -28,8 +28,11 @@
 #   SSH_RATE=6    SSH_BURST=5          per-IP новых SSH/мин до бана
 #   SSH_BAN_TIME=24h  PORTSCAN_BAN_TIME=1h
 #   ENABLE_PORTSCAN_BAN=1  ENABLE_CROWDSEC=1  ENABLE_SYNPROXY=0
-#   CROWDSEC_STRICT=0                  1 = ставить CrowdSec ТОЛЬКО из пиннингованного
-#                                      APT-репо; не поднялся — пропустить (без curl|bash)
+#   CROWDSEC_STRICT=1                  ставить CrowdSec ТОЛЬКО из пиннингованного APT-репо;
+#                                      не поднялся — пропустить (0 = разрешить curl|bash)
+#   UDP_BULK_PORTS=""                  порты объёмного UDP-туннеля (Hysteria2/TUIC): свой,
+#   UDP_BULK_RATE=50000                намного более высокий per-IP потолок, иначе общий
+#   UDP_BULK_BURST=100000              UDP_RATE душит туннель до ~2 Мбит/с
 #   FW_MODE=strict|open|skip           strict: блок всех портов, кроме разрешённых (дефолт);
 #                                      open: защита без блокировки прочих портов (3x-ui);
 #                                      skip: nftables не трогать вообще (только CrowdSec)
@@ -73,8 +76,12 @@ NODE_PORT_LAST="${NODE_PORT_LAST:-}"    # кэш последнего удачн
 WHITELIST="${WHITELIST:-}"
 SYN_RATE="${SYN_RATE:-200}";  SYN_BURST="${SYN_BURST:-400}"
 UDP_RATE="${UDP_RATE:-200}";  UDP_BURST="${UDP_BURST:-400}"
-# Порты с легитимным объёмным UDP (Hysteria2/TUIC): общий UDP_RATE их душит,
-# поэтому у них отдельный, намного более высокий per-IP потолок.
+# Порты, по которым идёт объёмный туннельный UDP (Hysteria2/TUIC), а не запросы к сервису.
+# Общий UDP_RATE=200 пакетов/с на IP при ~1200 Б/пакет — это потолок около 2 Мбит/с: живая
+# HY2-сессия упирается в него сразу, лишнее уходит в drop, клиент ретранслитит и видит
+# огромную задержку либо N/A на хосте. Перечисленные здесь порты получают свой, намного
+# более высокий per-IP потолок — настоящий флуд он всё ещё срезает. Пусто по умолчанию:
+# ослабление лимита должно быть осознанным. Порт должен присутствовать и в UDP_PORTS.
 UDP_BULK_PORTS="${UDP_BULK_PORTS:-}"
 UDP_BULK_RATE="${UDP_BULK_RATE:-50000}"; UDP_BULK_BURST="${UDP_BULK_BURST:-100000}"
 # CONN_LIMIT — потолок ОДНОВРЕМЕННЫХ конн. с одного IP. За CGNAT (мобильные операторы,
@@ -90,11 +97,12 @@ PORTSCAN_BAN_TIME="${PORTSCAN_BAN_TIME:-1h}"
 PORTSCAN_RATE="${PORTSCAN_RATE:-15}"; PORTSCAN_BURST="${PORTSCAN_BURST:-30}"  # /minute, per-IP
 ENABLE_PORTSCAN_BAN="${ENABLE_PORTSCAN_BAN:-1}"
 ENABLE_CROWDSEC="${ENABLE_CROWDSEC:-1}"
-# CROWDSEC_STRICT=1 — никакого curl|bash-фоллбэка: не поднялся пиннингованный репо,
-# значит CrowdSec просто не ставим. Фоллбэк форсируется атакующим (достаточно сделать
-# packagecloud недостижимым — egress-фильтр, DNS), а это подмена проверенного по
-# отпечатку APT-репо на неверифицированный код из сети, запускаемый root'ом.
-CROWDSEC_STRICT="${CROWDSEC_STRICT:-0}"
+# CROWDSEC_STRICT=1 (дефолт с v4.0) — никакого curl|bash-фоллбэка: не поднялся
+# пиннингованный репо, значит CrowdSec просто не ставим. Фоллбэк форсируется атакующим
+# (достаточно сделать packagecloud недостижимым — egress-фильтр, DNS), а это подмена
+# проверенного по отпечатку APT-репо на неверифицированный код из сети, запускаемый
+# root'ом. Осознанно ослабить до прежнего поведения можно `CROWDSEC_STRICT=0`.
+CROWDSEC_STRICT="${CROWDSEC_STRICT:-1}"
 ENABLE_SYNPROXY="${ENABLE_SYNPROXY:-0}"
 # Режим файрвола:
 #   strict — input policy drop: открыты ТОЛЬКО SSH/сервисные/node-agent порты
@@ -224,8 +232,9 @@ validate_port_list "$SSH_PORT" SSH_PORT || exit 1
 [[ "$NODE_PORT" == "auto" ]] || validate_port_list "$NODE_PORT" NODE_PORT || exit 1
 validate_port_list "$TCP_PORTS" TCP_PORTS || exit 1
 validate_port_list "$UDP_PORTS" UDP_PORTS || exit 1
-# Пустой = класса объёмного UDP нет (нода без Hysteria2/TUIC) — это норма, не ошибка.
-[[ -z "$UDP_BULK_PORTS" ]] || validate_port_list "$UDP_BULK_PORTS" UDP_BULK_PORTS || exit 1
+# Список, а не число: валидировать его как uint — значит уронить любой прогон с дефолтом
+# (пустая строка не uint), поэтому только validate_port_list, который пустое пропускает.
+validate_port_list "$UDP_BULK_PORTS" UDP_BULK_PORTS || exit 1
 # кэш прошлого детекта приходит из conf — битый молча сбрасываем (уйдёт в nft-ruleset)
 validate_port_list "$NODE_PORT_LAST" NODE_PORT_LAST 2>/dev/null || NODE_PORT_LAST=""
 
@@ -237,9 +246,6 @@ _is_duration() { [[ "$1" =~ ^[0-9]+(s|m|h|d)?$ ]]; }
 # systemd-time (OnUnitActiveSec): один числовой терм с опц. словом-единицей. Уходит
 # в .timer-юнит → валидируем, чтобы непровалидированный ENV не дописал директив.
 _is_systime()  { [[ "$1" =~ ^[0-9]+(s|sec|m|min|h|hr|d|day)?$ ]]; }
-# UDP_BULK_PORTS сюда НЕ входит: это список портов ("443" или "443,8443"), а не
-# число, и по умолчанию он пуст. В числовом цикле он валил ре-ран на любой ноде
-# без Hysteria2 ещё до генерации правил. Порты проверяются своей валидацией ниже.
 for _k in SYN_RATE SYN_BURST UDP_RATE UDP_BURST UDP_BULK_RATE UDP_BULK_BURST CONN_LIMIT ICMP_RATE ICMP_BURST \
           SSH_RATE SSH_BURST PORTSCAN_RATE PORTSCAN_BURST SAFETY_DELAY \
           NA_CTG_PHANTOM_MIN NA_CTG_LIVE_FLOOR NA_CTG_COARSE_MULT; do
@@ -575,20 +581,21 @@ done
 UDP_RULES=""
 for p in ${UDP_PORTS//,/ }; do
     [[ -z "$p" ]] && continue
-    # Порты из UDP_BULK_PORTS несут полезный объёмный трафик (Hysteria2/TUIC), а не
-    # запросы к сервису. Общий UDP_RATE=200 пакетов/с на IP — это потолок ~2 Мбит/с:
-    # живой HY2 упирается в него мгновенно, пакеты уходят в drop, и клиент видит то
-    # огромный пинг от ретрансмиссий, то N/A. Таким портам даём свой, высокий лимит:
-    # он всё ещё режет настоящий флуд, но не мешает нормальной работе.
-    local_rate="$UDP_RATE"; local_burst="$UDP_BURST"; _kind="анти-UDP-flood"
+    # порт объёмного туннеля получает свой потолок (см. UDP_BULK_PORTS выше)
+    _urate="$UDP_RATE"; _uburst="$UDP_BURST"; _ukind="анти-UDP-flood"
     if [[ ",${UDP_BULK_PORTS}," == *",${p},"* ]]; then
-        local_rate="$UDP_BULK_RATE"; local_burst="$UDP_BULK_BURST"; _kind="объёмный UDP (HY2/TUIC)"
+        _urate="$UDP_BULK_RATE"; _uburst="$UDP_BULK_BURST"; _ukind="объёмный туннель, высокий потолок"
     fi
     UDP_RULES+="
-        # порт ${p}/udp: per-IP rate — ${_kind}
-        udp dport ${p} meter udp4_${p} { ip saddr limit rate ${local_rate}/second burst ${local_burst} packets } accept
-        udp dport ${p} meter udp6_${p} { ip6 saddr limit rate ${local_rate}/second burst ${local_burst} packets } accept
+        # порт ${p}/udp: per-IP rate (QUIC/Hysteria2/TUIC) — ${_ukind}
+        udp dport ${p} meter udp4_${p} { ip saddr limit rate ${_urate}/second burst ${_uburst} packets } accept
+        udp dport ${p} meter udp6_${p} { ip6 saddr limit rate ${_urate}/second burst ${_uburst} packets } accept
         udp dport ${p} drop"
+done
+# Порт в bulk-списке, но не в UDP_PORTS — правило для него не сгенерится вообще: молчать нельзя.
+for p in ${UDP_BULK_PORTS//,/ }; do
+    [[ -z "$p" ]] && continue
+    [[ ",${UDP_PORTS}," == *",${p},"* ]] || warn "UDP_BULK_PORTS: порт $p не входит в UDP_PORTS — правило для него не создаётся"
 done
 
 # anti-spoofing (только на WAN-интерфейсе)
@@ -1291,8 +1298,10 @@ grep -hoE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?' "$TMP/v4.raw" 2>/dev/null 
   | sort -u > "$TMP/v4.clean"
 # v6: из jq-чистых .cidr (+ кастомные), базовая sanity
 grep -hE '^[0-9a-fA-F:/]+$' "$TMP/v6.raw" 2>/dev/null | grep ':' | sort -u > "$TMP/v6.clean"
-N4="$(grep -c . "$TMP/v4.clean" 2>/dev/null || echo 0)"
-N6="$(grep -c . "$TMP/v6.clean" 2>/dev/null || echo 0)"
+# `grep -c` на пустом файле САМ печатает 0 и возвращает rc=1, поэтому `|| echo 0` дописал бы
+# второй ноль и превратил число в "0\n0" — арифметика ниже сломалась бы на ровном месте.
+N4="$(grep -c . "$TMP/v4.clean" 2>/dev/null)"; N4="${N4:-0}"
+N6="$(grep -c . "$TMP/v6.clean" 2>/dev/null)"; N6="${N6:-0}"
 [ "$N4" -gt 0 ] || { logger -t "$TAG" "0 v4-записей (фиды недоступны?) — last-known-good"; exit 0; }
 {
     echo "flush set inet na_filter blocklist_v4"
@@ -1431,7 +1440,10 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
           | sed -n '/elements[[:space:]]*=/,$p' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}'
     done
 } 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u > "$TMP/protected"
-NPROT="$(grep -c . "$TMP/protected" 2>/dev/null || echo 0)"
+# `grep -c` на пустом файле САМ печатает 0 и возвращает rc=1: `|| echo 0` дописал бы
+# второй ноль, и `[ "0\n0" -lt 1 ]` упал бы с ошибкой синтаксиса — то есть гард ниже
+# НЕ сработал бы ровно в том случае, ради которого он написан (разбор сломался).
+NPROT="$(grep -c . "$TMP/protected" 2>/dev/null)"; NPROT="${NPROT:-0}"
 # Пустой protected — это не «нечего защищать», а сломанный разбор. Без него блоклист
 # может накрыть панель, и мы этого не заметим: лучше громко отказаться от обновления.
 if [ "${NPROT:-0}" -lt 1 ]; then
@@ -1562,8 +1574,9 @@ done < <(sort -u "$TMP/v4.raw")
 sort -u -o "$TMP/v4.clean" "$TMP/v4.clean"
 grep -E '^[0-9a-fA-F:]+/[0-9]+$' "$TMP/v6.raw" 2>/dev/null | sort -u > "$TMP/v6.clean"
 
-N4="$(grep -c . "$TMP/v4.clean" 2>/dev/null || echo 0)"
-N6="$(grep -c . "$TMP/v6.clean" 2>/dev/null || echo 0)"
+# см. выше: `|| echo 0` на пустом файле даёт "0\n0" и ломает арифметику
+N4="$(grep -c . "$TMP/v4.clean" 2>/dev/null)"; N4="${N4:-0}"
+N6="$(grep -c . "$TMP/v6.clean" 2>/dev/null)"; N6="${N6:-0}"
 [ "$N4" -gt 0 ] || { logger -t "$TAG" "0 v4-записей (ASN=${n_asn}, фиды=${n_feed}) — last-known-good"; exit 0; }
 {
     echo "flush set inet na_filter scanner_v4"
@@ -1701,12 +1714,27 @@ SS_TOTAL="$(ss -tnH state established 2>/dev/null | wc -l)"
 [ "$CT_TOTAL" -ge $((SS_TOTAL * COARSE_MULT)) ] || exit 0
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-# живые established по src-IP клиента
+# Живые established по src-IP клиента.
+# `::ffff:` снимаем обязательно: когда сервис слушает на `*:443` (v6-сокет принимает
+# v4-mapped), ss печатает пиров как `[::ffff:1.2.3.4]`, а conntrack — голым `1.2.3.4`.
+# Без нормализации лукап живых сокетов не матчится НИКОГДА, live всегда читается как 0,
+# и LIVE_FLOOR — вся CGNAT-защита — не срабатывает: эвиктится любой холдер выше
+# PHANTOM_MIN. Ровно та же нормализация давно стоит в harvest_node_port_peers().
 ss -tnH state established 2>/dev/null | awk '{print $NF}' \
-  | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//' | sort | uniq -c > "$TMP/live"
-# conntrack по ПЕРВОМУ src= (это клиентский IP) — только tcp
+  | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff:([0-9.]+)$/\1/' | sort | uniq -c > "$TMP/live"
+# Адреса, которые НЕ могут быть источником входящей атаки и потому не бывают кандидатами.
+# Первый src= в записи conntrack — клиентский IP только для ВХОДЯЩИХ соединений; для
+# исходящих (xray → сайт) это адрес самой ноды, а на relay исходящие доминируют. Без
+# фильтра нода становится крупнейшим «фантом-холдером»: банит сама себя, и `conntrack -D`
+# по своему адресу сносит состояние всех проксируемых сессий разом. Приватные диапазоны
+# отсекаем по той же причине — там живут docker-бриджи и туннельные плечи.
+SELF_RE="$( { ip -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+              printf '127.0.0.1\n::1\n'; } | sed 's/\./\\./g' | paste -sd'|' - )"
+PRIV_RE='^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|f[cd]|fe[89ab])'
+# conntrack по ПЕРВОМУ src= — только tcp, без собственных и служебных адресов
 conntrack -L -p tcp 2>/dev/null \
   | awk '{for(i=1;i<=NF;i++) if($i ~ /^src=/){print substr($i,5); break}}' \
+  | grep -Ev "^(${SELF_RE})$" | grep -Ev "$PRIV_RE" \
   | sort | uniq -c | sort -rn > "$TMP/ct"
 
 is_white() {  # в whitelist na_filter или в fleet-сете?
@@ -1843,7 +1871,7 @@ done
 echo "── Топ-$N удалённых IP по established TCP на портах: $PORTS ──"
 ss -Hnt state established "( $filt )" 2>/dev/null \
     | awk '{print $5}' \
-    | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//' \
+    | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff:([0-9.]+)$/\1/' \
     | sort | uniq -c | sort -rn | head -n "$N"
 TT
 chmod +x /usr/local/sbin/na-fw-top-talkers

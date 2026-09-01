@@ -24,6 +24,13 @@
 - **zram-swap** на мелких нодах (tier 1/2), иначе `/swapfile`; **MSS clamp к PMTU** (opt-in, для
   routed/WireGuard); **`tcp_min_snd_mss`-пол** от MSS-коллапса на туннелях.
 - **nofile/nproc → 1 048 576**, journald-cap, THP=never, governor=performance, NIC tune, irqbalance.
+- **Ротация логов ноды + часовой таймер.** journald-cap держит только журнал systemd, а `access.log`
+  от nginx и ядра ноды растёт в /var/log без предела — на боевой ноде это сотни МБ в сутки, и диск
+  уходит в 100% за недели (тихо: контейнеры перестают писать логи, `acme.sh` не может обновить
+  сертификат). Штатной ротации мало: `maxsize` проверяется только в момент запуска logrotate, а тот
+  суточный, поэтому файл проскакивает лимит между прогонами — наблюдалось превышение заявленного
+  капа в девять раз. Ставится сам пакет `logrotate` (на минимальных образах его нет, и станса лежит
+  мёртвым грузом), станса на пути ноды и `na-logrotate.timer` с часовым прогоном.
 
 ### 🛡 Защита (`scripts/protect.sh`)
 `nftables`-движок в **своей** таблице `inet na_filter` (не `flush ruleset` — сосуществует с CrowdSec и Docker):
@@ -64,8 +71,9 @@
   keyring кладётся **ровно он** (а не всё, что приехало в ответе). Suite берётся канонический
   `any/any` — он же работает на Debian 13 (trixie), где у CrowdSec **нет** своего suite, а
   родной пакет дистрибутива устарел; дальше фоллбэки на `<os>/<codename>` и `bookworm`/`noble`.
-  Не поднялся вообще — официальный установщик (`curl|bash`, громкий warn), а `CROWDSEC_STRICT=1`
-  запрещает и это. `CROWDSEC_PROBE=1` — проверить резолв репо/пакетов на этой ОС без установки.
+  Не поднялся вообще — CrowdSec просто не ставится: `CROWDSEC_STRICT=1` с v4.0 стоит по умолчанию,
+  потому что фоллбэк на `curl|bash`-установщик форсируется атакующим (достаточно сделать репозиторий
+  недоступным). Вернуть прежнее поведение — `CROWDSEC_STRICT=0`. `CROWDSEC_PROBE=1` — проверить резолв репо/пакетов на этой ОС без установки.
 - Полный **IPv6-паритет**, **rate-limit на логи**, **авто-whitelist твоего SSH-IP** + **сейфти-таймер** от самоблокировки.
 - **Анти-локаут по SSH-порту**: порт берётся из `sshd -T` и socket-юнита (Ubuntu 24.04+
   слушает `ssh.socket`, где `Port` из `sshd_config` игнорируется), а порт **текущей
@@ -110,11 +118,11 @@ curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/ins
 
 # прод-режим: пиньте тег через NA_REF — компрометация ветки main тогда не утечёт
 # сразу на весь флот (скрипты тянутся из того же тега):
-export NA_REF=v3.9.2
+export NA_REF=v4.0.1
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 
 # максимум: + проверка minisign-подписей модулей (подписи лежат в дереве с v3.6):
-export NA_REF=v3.9.2 NA_REQUIRE_SIG=1 \
+export NA_REF=v4.0.1 NA_REQUIRE_SIG=1 \
        NA_MINISIGN_PUBKEY="RWQrJghT9nkdBC3ntiEXF29zrS8o429WhObHKq6I7CKoftVDhQBrBscu"
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 ```
@@ -142,6 +150,8 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `WHITELIST` | _пусто_ | IP/CIDR (v4+v6) панели/мониторинга — никогда не банятся |
 | `SYN_RATE`/`SYN_BURST` | `200`/`400` | **per-IP** новых TCP-конн./сек на порт |
 | `UDP_RATE`/`UDP_BURST` | `200`/`400` | **per-IP** UDP пакетов/сек |
+| `UDP_BULK_PORTS` | _пусто_ | порты объёмного UDP-туннеля (Hysteria2/TUIC). Общий `UDP_RATE` — это потолок около 2 Мбит/с: он душит туннель, клиент ретранслитит и видит огромную задержку. Порт должен быть и в `UDP_PORTS` |
+| `UDP_BULK_RATE`/`UDP_BULK_BURST` | `50000`/`100000` | per-IP потолок для этих портов |
 | `CONN_LIMIT` | `2048` | макс. одновременных конн. с одного IP (с запасом под CGNAT) |
 | `ICMP_RATE`/`ICMP_BURST` | `10`/`20` | **per-IP** ICMP echo/сек (раньше был глобальный потолок) |
 | `SSH_RATE`/`SSH_BURST` | `6`/`5` | новых SSH/мин до бана |
@@ -149,7 +159,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `ENABLE_PORTSCAN_BAN` | `1` | автобан за скан закрытых портов |
 | `PORTSCAN_RATE`/`PORTSCAN_BURST` | `15`/`30` | порог скана (SYN на закрытые порты/мин, per-IP) до бана — ниже порога просто дроп, без бана |
 | `ENABLE_CROWDSEC` | `1` | ставить CrowdSec + bouncer |
-| `CROWDSEC_STRICT` | `0` | `1` — только пиннингованный APT-репо; не поднялся → CrowdSec пропускается (без `curl\|bash`-фоллбэка) |
+| `CROWDSEC_STRICT` | `1` | только пиннингованный APT-репо; не поднялся → CrowdSec пропускается. `0` возвращает `curl\|bash`-фоллбэк, который атакующий может форсировать, сделав репозиторий недоступным |
 | `ENABLE_SYNPROXY` | `0` | nft synproxy на сервисные порты (advanced). На VPN-relay избыточен — syncookies + per-IP ct-лимиты уже дают анти-спуф; включать под подтверждённый спуф-SYN-флуд |
 | `CROWDSEC_ENROLL_KEY` | _пусто_ | enroll в CrowdSec Console |
 | `SAFETY_DELAY` | `300` | сек до авто-сброса правил, если не подтвердить SSH. Сброс снимает и таблицу, и автозагрузку (`na-firewall.service`) — иначе локаут вернулся бы ребутом |
@@ -167,12 +177,12 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `REMNAWAVE_NODES_URL` | _пусто_ | fleet-sync **без токена на ноде**: URL статического списка нод (JSON вида `/api/nodes` или plain-text «адрес на строку») |
 | `CADDY_AUTH_API_TOKEN` | _пусто_ | Caddy Security / Tiny Auth перед панелью → `X-Api-Key` на запросы fleet-sync. Алиас: `REMNAWAVE_CADDY_TOKEN` |
 | `FLEET_SYNC` | `auto` | `auto` (вкл при URL+TOKEN) / `1` / `0` |
-| `FLEET_SYNC_INTERVAL` | `5min` | интервал синка нод флота |
 | `ENABLE_CTGUARD` | `0` | conntrack phantom-eviction (анти connect-and-hold) |
 | `NA_CTG_ENFORCE` | `0` | `0` — observe (только лог), `1` — эвиктить фантомы |
-| `NA_CTG_PHANTOM_MIN` / `NA_CTG_LIVE_FLOOR` | `4000` / `2` | порог conntrack-холдера / порог живых сокетов |
+| `NA_CTG_PHANTOM_MIN` / `NA_CTG_LIVE_FLOOR` | `4000` / `2` | порог conntrack-холдера / порог живых сокетов. `LIVE_FLOOR` подбирают по observe-режиму: у обычных клиентов бывает 1–2 живых сокета при заметном conntrack |
+| `NA_CTG_BANTIME` / `NA_CTG_INTERVAL` / `NA_CTG_COARSE_MULT` | `15m` / `20s` / `3` | срок эвикта / период проверки / во сколько раз conntrack должен превышать число живых сокетов, чтобы вообще запускать разбор |
 
-`optimize.sh`: `ENABLE_XANMOD=1`, `XANMOD_FLAVOR=lts|main|edge|rt`, `XANMOD_PKG=...`, `REMNAWAVE_SWAP_SIZE=2G`, `TCP_ECN_MODE=2` (0/1/2), `DISABLE_TFO=0`, `CT_EST_TIMEOUT=7440` (conntrack established-timeout, сек; ↑ напр. до `14400` для idle-туннелей/мостов без частого keepalive), `QDISC=fq|fq_codel|cake` (cake — против bufferbloat на слабых аплинках; сравнивай A/B), `ENABLE_MSS_CLAMP=0` (для routed/WireGuard-нод), `SETUP_NO_ZRAM=0`. Буферы/conntrack/somaxconn — **tier-aware** (масштаб от RAM).
+`optimize.sh`: `ENABLE_XANMOD=1`, `XANMOD_FLAVOR=lts|main|edge|rt`, `XANMOD_PKG=...`, `REMNAWAVE_SWAP_SIZE=2G`, `TCP_ECN_MODE=2` (0/1/2), `DISABLE_TFO=0`, `CT_EST_TIMEOUT=7440` (conntrack established-timeout, сек; ↑ напр. до `14400` для idle-туннелей/мостов без частого keepalive), `QDISC=fq|fq_codel|cake` (cake — против bufferbloat на слабых аплинках; сравнивай A/B), `ENABLE_MSS_CLAMP=0` (для routed/WireGuard-нод), `SETUP_NO_ZRAM=0`, `ENABLE_LOGROTATE=1` + `NA_LOG_PATHS`/`NA_LOG_MAXSIZE=200M`/`NA_LOG_ROTATE=4`/`NA_LOG_INTERVAL=hourly` (ротация файловых логов ноды, см. ниже), `NA_REMNANODE_ENV=/opt/remnanode/.env` (откуда брать порт агента), `NA_CERT_PATHS` (доп. сертификаты для сенсора срока). Буферы/conntrack/somaxconn — **tier-aware** (масштаб от RAM).
 `XANMOD_PROBE=1` — проверить, что репозиторий+ключ+сборка ядра резолвятся на этой ОС, **без установки** (для CI и быстрой проверки совместимости).
 
 ---
@@ -260,7 +270,9 @@ sudo bash install.sh rollback optimize   # снять тюнинг (XanMod ос�
 - **Не `flush ruleset`.** Управляем только `inet na_filter` — CrowdSec-bouncer (`ip crowdsec`, priority −10)
   и Docker-NAT остаются нетронутыми (старый flush ломал Docker-сеть).
 - **IPv6-паритет** — autoban/whitelist/scan-детект **и v6-bogon anti-spoof** (раньше v6-сканеры/брут не банились вообще).
-- **Логи под rate-limit** — флуд сканов больше не забивает journald/диск.
+- **Логи под rate-limit** — флуд сканов больше не забивает journald/диск, а `na-diagnose` отдельно
+  показывает крупные файлы в /var/log, json-логи контейнеров и то, активен ли часовой таймер ротации
+  (в `--json`: `disk_pct`, `inode_pct`, `log_max_bytes`, `docker_log_max_bytes`, `logrotate_timer`).
 - **autoban с `size`-капом** — спуф-флудом чистого SYN нельзя раздуть set в памяти ядра.
 - **CGNAT-дружелюбность** — portscan-бан срабатывает по порогу скорости скана (а не по одному SYN, который за CGNAT банил весь оператор); ICMP-лимит per-IP, а не глобальный; `CONN_LIMIT` с большим запасом. Датчик `макс конн/IP vs CONN_LIMIT` в 🩺 диагностике показывает, душит ли лимит на самом деле.
 - **conntrack-ёмкость от RAM** — мелкая VPS под флудом не упирается в OOM ядра.

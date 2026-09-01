@@ -13,6 +13,9 @@
 #   XANMOD_FLAVOR=lts сборка: lts (стабильная, по умолч.) | main | edge | rt
 #   XANMOD_PKG=...     полностью переопределить имя пакета
 #   REMNAWAVE_SWAP_SIZE=2G
+#   ENABLE_LOGROTATE=1 ротация файловых логов ноды + часовой таймер (0 = не трогать)
+#   NA_LOG_PATHS="/var/log/nginx/*.log /var/log/remnanode/*.log"   что ротировать
+#   NA_LOG_MAXSIZE=200M  NA_LOG_ROTATE=4  NA_LOG_INTERVAL=hourly
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,6 +39,11 @@ fi
 # Подхватываем сохранённый конфиг оптимизатора (ENV по-прежнему переопределяет).
 load_conf "$CONF_DIR/optimize.conf"
 
+# apt по умолчанию НЕ ждёт чужой dpkg-лок, а падает сразу. На свежем боксе первые минуты
+# лок держит unattended-upgrades, и без этого таймаута установка ядра обрывалась с
+# «Could not get lock … held by unattended-upgr» — при живом репозитории и исправном боксе.
+APT_LOCK=(-o DPkg::Lock::Timeout=300)
+
 # DRY_RUN: protect.sh поддерживает полноценный dry-run (генерит ruleset, не применяет),
 # и пользователь по аналогии может ждать того же от `DRY_RUN=1 install.sh optimize|all`.
 # Оптимизатор же мутирует НЕОБРАТИМО (ставит ядро, свап, sysctl) — тихо отработать
@@ -43,7 +51,8 @@ load_conf "$CONF_DIR/optimize.conf"
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
     info "DRY_RUN=1: детальный dry-run для оптимизатора НЕ поддержан (мутации ядро/свап/sysctl необратимы)."
     info "Было бы сделано: XanMod (ENABLE_XANMOD=${ENABLE_XANMOD:-1}), sysctl (BBR/буферы/conntrack),"
-    info "  лимиты 1M, RPS/RFS/XPS, NIC-tune, swap/zram, journald-cap, THP=never, governor=performance."
+    info "  лимиты 1M, RPS/RFS/XPS, NIC-tune, swap/zram, journald-cap, ротация логов + часовой таймер,"
+    info "  THP=never, governor=performance."
     info "Проверить XanMod-репо без установки: XANMOD_PROBE=1. Dry-run фаервола: DRY_RUN=1 protect.sh."
     exit 0
 fi
@@ -142,18 +151,18 @@ setup_xanmod_repo() {
     # фоллбэк на bookworm падал так же, и ядро молча не ставилось «репо недоступен».
     local -a UPDSC=(-o "Dir::Etc::sourcelist=$list" -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0)
     echo "deb [signed-by=$keyring] https://deb.xanmod.org $codename main" > "$list"
-    if ! apt-get -o DPkg::Lock::Timeout=300 update -qq "${UPDSC[@]}" 2>/dev/null; then
+    if ! apt-get "${APT_LOCK[@]}" update -qq "${UPDSC[@]}" 2>/dev/null; then
         if [[ "$codename" != "bookworm" ]]; then
             warn "Suite '$codename' не поднялся — откатываюсь на 'bookworm' (LTS)"
             codename="bookworm"; XANMOD_FLAVOR="lts"
             echo "deb [signed-by=$keyring] https://deb.xanmod.org $codename main" > "$list"
-            apt-get -o DPkg::Lock::Timeout=300 update -qq "${UPDSC[@]}" 2>/dev/null || { warn "XanMod-репо недоступен"; rm -f "$list"; return 1; }
+            apt-get "${APT_LOCK[@]}" update -qq "${UPDSC[@]}" 2>/dev/null || { warn "XanMod-репо недоступен"; rm -f "$list"; return 1; }
         else
             warn "XanMod-репо ('bookworm') недоступен"; rm -f "$list"; return 1
         fi
     fi
     # общий кэш (чтобы apt-cache/install видели пакеты); чужие битые источники не фатальны
-    apt-get update -qq 2>/dev/null || true
+    apt-get "${APT_LOCK[@]}" update -qq 2>/dev/null || true
     return 0
 }
 
@@ -185,7 +194,7 @@ install_xanmod() {
         # APT::Status-Fd=1 → машинный прогресс в stdout; stdbuf -oL снимает буферизацию пайпа.
         # pkg НЕ трогаем в subshell справа от пайпа (там только отрисовка) — ставим в родителе.
         if DEBIAN_FRONTEND=noninteractive stdbuf -oL \
-                apt-get -o APT::Status-Fd=1 -o DPkg::Lock::Timeout=300 install -y "$p" 2>"$err_log" \
+                apt-get -o APT::Status-Fd=1 "${APT_LOCK[@]}" install -y "$p" 2>"$err_log" \
                 | while IFS=: read -r f1 f2 f3 f4 _r; do
                     case "$f1" in
                         pmstatus|dlstatus)
@@ -227,7 +236,7 @@ if [[ "${XANMOD_PROBE:-0}" == "1" ]]; then
     for p in $cand; do
         if apt-cache show "$p" >/dev/null 2>&1; then
             ok "XANMOD_PROBE: '$p' доступен в репозитории"
-            DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install --download-only -y "$p" >/dev/null 2>&1 \
+            DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK[@]}" install --download-only -y "$p" >/dev/null 2>&1 \
                 && ok "XANMOD_PROBE: '$p' скачивается" \
                 || warn "XANMOD_PROBE: '$p' в индексе есть, но download-only не прошёл (зависимости дистрибутива)"
             exit 0
@@ -660,6 +669,146 @@ J
 systemctl restart systemd-journald
 ok "journald ≤ 300M"
 
+# ─── 8b. Ротация файловых логов ноды ─────────────────────────────────────────
+# journald-cap выше держит только журнал systemd. Логи, которые пишут nginx и ядро ноды
+# (xray) в /var/log, к нему отношения не имеют и растут без предела: на боевой ноде это
+# сотни МБ в сутки, и диск уходит в 100% за недели. Диск на 100% тише, чем кажется:
+# контейнеры перестают писать логи (нода становится ненаблюдаемой), а acme.sh не может
+# обновить сертификат.
+#
+# Почему свой таймер, а не штатной ротации достаточно: `maxsize` проверяется ТОЛЬКО в
+# момент запуска logrotate, а системный logrotate.timer суточный. При росте в сотни МБ
+# в сутки файл спокойно проскакивает лимит между прогонами — наблюдалось превышение
+# заявленного капа в девять раз. Часовой прогон гоняет ВЕСЬ /etc/logrotate.conf с тем же
+# системным state-файлом: стансы со своим периодом (daily/weekly) от этого чаще не
+# ротируются — только те, что реально переросли размер.
+title "ротация логов ноды"
+ENABLE_LOGROTATE="${ENABLE_LOGROTATE:-1}"
+NA_LOG_PATHS="${NA_LOG_PATHS:-/var/log/nginx/*.log /var/log/remnanode/*.log}"
+NA_LOG_MAXSIZE="${NA_LOG_MAXSIZE:-200M}"
+NA_LOG_ROTATE="${NA_LOG_ROTATE:-4}"
+NA_LOG_INTERVAL="${NA_LOG_INTERVAL:-hourly}"
+LR_CONF=/etc/logrotate.d/na-node-logs
+
+if [[ "$ENABLE_LOGROTATE" != "1" ]]; then
+    info "ротация логов пропущена (ENABLE_LOGROTATE=0)"
+else
+    [[ "$NA_LOG_MAXSIZE" =~ ^[0-9]+[kKMG]$ ]] || { err "NA_LOG_MAXSIZE='$NA_LOG_MAXSIZE' — ожидается размер вида 200M"; exit 1; }
+    [[ "$NA_LOG_ROTATE"  =~ ^[0-9]+$ ]]       || { err "NA_LOG_ROTATE='$NA_LOG_ROTATE' — ожидается целое число"; exit 1; }
+    # Пути уходят в конфиг logrotate, который исполняется root'ом: пускаем только
+    # безопасный набор символов, без подстановок и разделителей команд.
+    [[ "$NA_LOG_PATHS" =~ ^[A-Za-z0-9_/*.\ -]+$ ]] || { err "NA_LOG_PATHS: недопустимые символы"; exit 1; }
+
+    # Сам бинарь может отсутствовать: на минимальных образах его нет, и тогда конфиг
+    # лежит мёртвым грузом — ротации не происходит вообще, а выглядит как настроенная.
+    if ! command -v logrotate >/dev/null 2>&1; then
+        apt_install logrotate || warn "logrotate не доустановился — ротация работать не будет"
+    fi
+
+    # Маски, уже покрытые ЧУЖОЙ стансой, забирать себе нельзя: logrotate на дубликат пути
+    # отвечает «duplicate log entry», целиком пропускает ту стансу, которой файл достался
+    # вторым, и выходит с ошибкой — na-logrotate.service уходит в failed при внешне
+    # здоровом таймере. Сверять маски СТРОКАМИ бесполезно: logrotate дедуплицирует по
+    # РАСКРЫТЫМ файлам, и чужая станса с явными путями или другим глобом проходит мимо
+    # текстового сравнения. Единственный честный арбитр — сам logrotate (`-d` по ВСЕМУ
+    # набору): пишем стансу целиком, спрашиваем его и конфликтные маски отдаём чужим
+    # стансам — у них может быть сигнальный reload вместо copytruncate, им и владеть.
+    # read -a, а не голый word-split: иначе шелл сам раскроет глобы по живым файлам,
+    # и в стансу лягут ЯВНЫЕ пути — лог нового vhost'а никогда не начнёт ротироваться.
+    _want=(); _dup=()
+    read -r -a _want <<<"$NA_LOG_PATHS"
+
+    _na_lr_write() {
+        if [[ "${#_want[@]}" -eq 0 ]]; then
+            rm -f "$LR_CONF"
+            return 0
+        fi
+        {
+            printf '%s ' "${_want[@]}"
+            cat <<LRC
+{
+    su root root
+    daily
+    rotate $NA_LOG_ROTATE
+    maxsize $NA_LOG_MAXSIZE
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+LRC
+        } > "$LR_CONF"
+        chmod 0644 "$LR_CONF"
+    }
+
+    # copytruncate, а не reopen-сигнал: nginx и ядро ноды живут в контейнерах, послать им
+    # USR1 из хостовой ротации некому.
+    backup_file "$LR_CONF" "$BACKUP"
+    _na_lr_write
+
+    if command -v logrotate >/dev/null 2>&1; then
+        while [[ "${#_want[@]}" -gt 0 ]]; do
+            _dupf="$({ logrotate -d /etc/logrotate.conf 2>&1 || true; } \
+                     | sed -n 's/.*duplicate log entry for //p' | sort -u)"
+            [[ -n "$_dupf" ]] || break
+            _keep=()
+            for _m in "${_want[@]}"; do
+                _hit=0
+                while IFS= read -r _f; do
+                    [[ -n "$_f" ]] || continue
+                    # shellcheck disable=SC2053  # маска без кавычек — намеренный glob-матч
+                    if [[ "$_f" == $_m ]]; then _hit=1; break; fi
+                done <<<"$_dupf"
+                if [[ "$_hit" -eq 1 ]]; then _dup+=("$_m"); else _keep+=("$_m"); fi
+            done
+            if [[ "${#_keep[@]}" -eq "${#_want[@]}" ]]; then
+                # наших масок дубликаты не задевают — это конфликт между чужими
+                # стансами, чинить его не нам
+                warn "дубликаты путей вне наших масок — часть чужих станс пропускается: logrotate -d /etc/logrotate.conf"
+                break
+            fi
+            _want=("${_keep[@]}")
+            _na_lr_write
+        done
+    fi
+
+    if [[ "${#_want[@]}" -gt 0 ]]; then
+        ok "стансa $LR_CONF: ${_want[*]} (maxsize $NA_LOG_MAXSIZE, rotate $NA_LOG_ROTATE)"
+    else
+        info "все заданные пути уже покрыты другими стансами — свою не создаю"
+    fi
+    for _m in "${_dup[@]}"; do
+        warn "маска $_m уже покрыта чужой стансой в /etc/logrotate.d — отдана ей; проверь, что там задан maxsize"
+    done
+
+    cat > /etc/systemd/system/na-logrotate.service <<'EOF'
+[Unit]
+Description=node-accelerator hourly log rotation
+Documentation=https://github.com/jestivald/node-accelerator
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/sbin/logrotate /etc/logrotate.conf
+EOF
+    cat > /etc/systemd/system/na-logrotate.timer <<EOF
+[Unit]
+Description=node-accelerator log rotation timer
+[Timer]
+OnCalendar=$NA_LOG_INTERVAL
+# Ноды флота не должны просыпаться в одну и ту же секунду.
+RandomizedDelaySec=300
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now na-logrotate.timer >/dev/null 2>&1 \
+        && ok "na-logrotate.timer: прогон $NA_LOG_INTERVAL" \
+        || warn "na-logrotate.timer не включился"
+fi
+
 # ─── 9. THP off ──────────────────────────────────────────────────────────────
 title "Transparent Huge Pages → never"
 cat > /etc/systemd/system/na-thp-off.service <<'EOF'
@@ -721,7 +870,8 @@ EOF
 # Персист конфига оптимизатора → ре-ран без ENV не сбрасывает выбор сборки/флейвора.
 save_conf "$CONF_DIR/optimize.conf" \
     ENABLE_XANMOD XANMOD_FLAVOR REMNAWAVE_SWAP_SIZE \
-    DISABLE_TFO TCP_ECN_MODE ENABLE_MSS_CLAMP SETUP_NO_ZRAM CT_EST_TIMEOUT QDISC
+    DISABLE_TFO TCP_ECN_MODE ENABLE_MSS_CLAMP SETUP_NO_ZRAM CT_EST_TIMEOUT QDISC \
+    ENABLE_LOGROTATE NA_LOG_PATHS NA_LOG_MAXSIZE NA_LOG_ROTATE NA_LOG_INTERVAL
 
 title "ГОТОВО"
 ok "Оптимизатор применён."

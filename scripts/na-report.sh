@@ -99,11 +99,39 @@ timeline_csv() {
 top_ips_raw() { awk -F'\t' '{c[$3]++} END{for(ip in c) print c[ip], ip}' "$TMP" | sort -rn | head -n "$TOPN"; }
 
 # ─── ASN/гео через Team Cymru (bulk, best-effort) ───────────────────────────────
-# Заполняет ассоц-массивы ASN[ip] / CC[ip] / ANAME[ip]. Тихо пропускает без whois/сети.
+# Заполняет ассоц-массивы ASN[ip] / CC[ip] / ANAME[ip]. Тихо пропускает без сети.
 declare -A ASN CC ANAME
+
+# Тот же справочник Cymru, но по DNS: origin.asn.cymru.com отдаёт «ASN | префикс | CC |…»
+# для перевёрнутого адреса, asn.cymru.com — имя оператора. Медленнее bulk-режима whois
+# (запрос на адрес), поэтому спрашиваем только про верхушку списка.
+enrich_asn_dns() {
+    command -v dig >/dev/null 2>&1 || return 0
+    local ip rev txt asn name n=0
+    for ip in "$@"; do
+        [[ "$ip" == *:* ]] && continue          # v6 в этой схеме не спрашиваем
+        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+        (( n++ > 24 )) && break                 # верхние 25 адресов отчёта
+        rev="$(awk -F. '{print $4"."$3"."$2"."$1}' <<<"$ip")"
+        txt="$(dig +short +time=2 +tries=1 "${rev}.origin.asn.cymru.com" TXT 2>/dev/null | head -1 | tr -d '"')"
+        [[ -n "$txt" ]] || continue
+        asn="$(awk -F'|' '{gsub(/ /,"",$1); print $1}' <<<"$txt")"
+        [[ "$asn" =~ ^[0-9]+$ ]] || continue
+        ASN["$ip"]="AS$asn"
+        CC["$ip"]="$(awk -F'|' '{gsub(/ /,"",$3); print $3}' <<<"$txt")"
+        name="$(dig +short +time=2 +tries=1 "AS${asn}.asn.cymru.com" TXT 2>/dev/null | head -1 | tr -d '"' \
+                | awk -F'|' '{sub(/^ +/,"",$5); sub(/ +$/,"",$5); print $5}')"
+        ANAME["$ip"]="${name%%,*}"
+    done
+}
 enrich_asn() {
     local ips=("$@"); [[ ${#ips[@]} -gt 0 ]] || return 0
-    command -v whois >/dev/null 2>&1 || return 0
+    # Пакета whois нет в базовой поставке Debian/Ubuntu, и тулкит его не ставит — то есть
+    # на типовой ноде обогащение молча не работало никогда. У Cymru есть тот же сервис
+    # через DNS, а dig на ноде уже используется (rDNS ниже), поэтому сперва пробуем его.
+    if ! command -v whois >/dev/null 2>&1; then
+        enrich_asn_dns "${ips[@]}"; return 0
+    fi
     local query out line ip asn cc name
     query=$'begin\nverbose\n'
     for ip in "${ips[@]}"; do
@@ -212,7 +240,7 @@ focus_ip() {
         printf '%s' "$ptr" | grep -qiE 'scan|probe|crawl|bot|spider|census|shodan' \
             && status_line FAIL "rDNS: $ptr (паттерн сканера/бота)" || info "rDNS: $ptr"
     else info "rDNS: нет PTR (у легит-сервисов обычно есть)"; fi
-    [[ -n "${ASN[$ip]:-}" ]] && status_line OK "ASN: ${ASN[$ip]} ${ANAME[$ip]:-} (${CC[$ip]:-?})" || info "ASN: н/д (нужен whois)"
+    [[ -n "${ASN[$ip]:-}" ]] && status_line OK "ASN: ${ASN[$ip]} ${ANAME[$ip]:-} (${CC[$ip]:-?})" || info "ASN: н/д (нет ответа Cymru — нужен dig или whois и исходящий DNS/43)"
     # активные conntrack-сессии (если есть conntrack-tools)
     if command -v conntrack >/dev/null 2>&1; then
         cc="$(conntrack -L 2>/dev/null | grep -Fc -- "$ip")"   # -F: точки IPv4 как литералы, не regex-«любой символ»

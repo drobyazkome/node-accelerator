@@ -62,6 +62,25 @@ rollback_optimize() {
     sysctl --system >/dev/null 2>&1 || true
     systemctl restart systemd-journald 2>/dev/null || true
 
+    # psi=1 в GRUB_CMDLINE_LINUX_DEFAULT снимаем ТОЛЬКО если дописывали его МЫ: ровно
+    # в этом случае в маркере есть строка psi=1. Оператор мог включить учёт давления
+    # сам (или он приехал из образа хостера) — чужой параметр загрузки не наш артефакт.
+    if [[ -f /etc/default/grub ]] \
+       && grep -qx 'psi=1' "$STATE_DIR/optimize.installed" 2>/dev/null \
+       && grep -qE '^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=.*psi=1' /etc/default/grub; then
+        # Правим ТОЛЬКО строку GRUB_CMDLINE_LINUX_DEFAULT: остальной cmdline (и чужие
+        # psi= в других переменных) не наше дело. Хвостовые пробелы подчищаем, иначе
+        # ре-ран optimize увидит «не в ожидаемом виде».
+        sed -i -E '/^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=/{
+            s/psi=1//g
+            s/="[[:space:]]+/="/
+            s/[[:space:]]+"[[:space:]]*$/"/
+            s/[[:space:]][[:space:]]+/ /g
+        }' /etc/default/grub 2>/dev/null || warn "не смог убрать psi=1 из /etc/default/grub — проверь вручную"
+        update-grub >/dev/null 2>&1 || true
+        info "psi=1 убран из GRUB_CMDLINE_LINUX_DEFAULT (/proc/pressure исчезнет после reboot)"
+    fi
+
     # XanMod-ядро: удаляем ТОЛЬКО если сейчас работаем не на нём (иначе оставим как есть)
     if [[ -f "$STATE_DIR/xanmod.pkg" ]]; then
         local pkg; pkg="$(cat "$STATE_DIR/xanmod.pkg")"

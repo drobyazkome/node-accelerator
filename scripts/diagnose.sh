@@ -7,6 +7,11 @@
 #   diagnose.sh --json      — один JSON-объект для флот-мониторинга (Zabbix/Prometheus)
 #   diagnose.sh --retrans [--window N]  — глубокий разбор причин TCP-retransmits
 #   diagnose.sh --attack  [--window N]  — форма текущей атаки (нужен ли na-fw-panic)
+#
+# ENV-ручки:
+#   NA_NODE_CONTAINER=<имя>   — контейнер node-агента (дефолт remnanode); на панели/
+#                               CDN-origin контейнер зовётся иначе или его нет вовсе
+#   NA_CERT_PATHS='<p1> <p2>' — доп. пути к fullchain для сенсора сроков TLS
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +29,167 @@ val()  { sysctl -n "$1" 2>/dev/null; }
 # для PRETTY_NAME, если есть.
 [[ -f /etc/os-release ]] && { . /etc/os-release 2>/dev/null || true; }
 
+# Имя контейнера node-агента. На панели Remnawave и на CDN-origin контейнер зовётся
+# иначе или его нет вовсе, а сенсор жёстко смотрел на `remnanode` — и на таком боксе
+# рапортовал «node-агент лежит» (issue #27/#33). Ручка даёт сказать правду обоим.
+NA_NODE_CONTAINER="${NA_NODE_CONTAINER:-remnanode}"
+
+# ─── Локальные хелперы сенсоров (нужны и --json, и человекочитаемой ветке) ────
+
+# timeout — coreutils, но diagnose обязан работать и на урезанном боксе: без него
+# просто зовём команду как есть.
+_to() { if command -v timeout >/dev/null 2>&1; then timeout "$@"; else shift; "$@"; fi; }
+
+# IPv4 → 32-битное целое; rc=1, если это не IPv4 (маска отрезается).
+_ip4_int() {
+    local o a b c d
+    IFS=. read -r a b c d <<<"${1%%/*}"
+    for o in "$a" "$b" "$c" "$d"; do
+        [[ "$o" =~ ^[0-9]{1,3}$ ]] && (( 10#$o <= 255 )) || return 1
+    done
+    echo $(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
+}
+# ip4_in_cidr <ip> <cidr|ip> — вхождение адреса в сеть, целочисленно. Без ipcalc/python:
+# на голой ноде их может не быть, а датчик обязан работать везде.
+ip4_in_cidr() {
+    local ip="$1" net="${2%%/*}" pfx=32 ipi neti mask
+    [[ "$2" == */* ]] && pfx="${2##*/}"
+    [[ "$pfx" =~ ^[0-9]{1,2}$ ]] && (( pfx <= 32 )) || return 1
+    ipi="$(_ip4_int "$ip")" || return 1
+    neti="$(_ip4_int "$net")" || return 1
+    (( pfx == 0 )) && return 0
+    mask=$(( (0xFFFFFFFF << (32 - pfx)) & 0xFFFFFFFF ))
+    (( (ipi & mask) == (neti & mask) ))
+}
+
+# Живой whitelist (обе семьи) — нужен и датчику CONN_LIMIT (#31), и сверке дрейфа (#38).
+# Читаем ОДИН раз: nft-вызов не бесплатен. Наборы na_fleet_* / na_nodeport_wl_* сюда
+# НЕ подмешиваем — это отдельные списки с другой судьбой при ре-ране.
+NA_WL4=""; NA_WL6=""; NA_WL_READ=0
+wl_live_load() {
+    [[ "$NA_WL_READ" == "1" ]] && return 0
+    NA_WL_READ=1
+    NA_WL4="$(nft_set_elems inet na_filter whitelist_v4 2>/dev/null)"
+    NA_WL6="$(nft_set_elems inet na_filter whitelist_v6 2>/dev/null)"
+    return 0
+}
+# in_whitelist <ip> — адрес покрыт живым whitelist'ом? v4 — с учётом CIDR, v6 — точное
+# совпадение (интервальных v6-вайтлистов на флоте нет, а разбор /64 стоил бы bigint).
+in_whitelist() {
+    local ip="$1" e
+    wl_live_load
+    if [[ "$ip" == *:* ]]; then
+        for e in $NA_WL6; do [[ "${e%%/*}" == "$ip" ]] && return 0; done
+        return 1
+    fi
+    for e in $NA_WL4; do
+        if [[ "$e" == */* ]]; then ip4_in_cidr "$ip" "$e" && return 0
+        elif [[ "$e" == "$ip" ]]; then return 0; fi
+    done
+    return 1
+}
+
+# conn_per_ip_max <csv-портов> — макс. число ВХОДЯЩИХ established с одного пира по тому
+# же срезу, что режет правило `ct count`. v4.0 считал ВЕСЬ `ss -tnH state established`:
+# туда попадали loopback-пары nginx↔xray (каждая учитывалась дважды), исходящие плечи и
+# вайтлист — а до `ct count` ни один из них не доходит (в цепочке выше два accept и
+# `iif lo accept`). Отсюда вечное «6790 из 8192» на здоровой ноде (issue #31).
+# echo: число (0 = внешних пиров нет); rc=1 = мерить не по чему (портов не задано).
+conn_per_ip_max() {
+    local ports="${1:-}" p filt="" cnt peer
+    for p in ${ports//,/ }; do
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
+        filt+="${filt:+ or }sport = :$p"
+    done
+    [[ -n "$filt" ]] || return 1
+    while read -r cnt peer; do
+        [[ "$cnt" =~ ^[0-9]+$ && -n "$peer" ]] || continue
+        [[ "$peer" == 127.* || "$peer" == "::1" ]] && continue
+        in_whitelist "$peer" && continue
+        echo "$cnt"; return 0
+    done < <(ss -tnH state established "( $filt )" 2>/dev/null \
+             | awk '{print $NF}' \
+             | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff:([0-9.]+)$/\1/' \
+             | sort | uniq -c | sort -rn)
+    echo 0
+}
+
+# psi_state — on | off-by-default | absent | unknown. XanMod (и сток Debian) собран с
+# CONFIG_PSI_DEFAULT_DISABLED=y: PSI ЕСТЬ, но /proc/pressure появляется только при
+# `psi=1` в cmdline. v4.0 знал два состояния и объяснял пропажу «старым ядром» на ядре
+# 6.18 — сенсор давления молчал на 100% боксов, и это выглядело как норма (issue #37).
+psi_state() {
+    [[ -r /proc/pressure/cpu ]] && { echo on; return 0; }
+    local kr cfg=""
+    kr="$(uname -r 2>/dev/null)"
+    if [[ -n "$kr" && -r "/boot/config-$kr" ]]; then
+        cfg="$(grep -E '^CONFIG_PSI(_DEFAULT_DISABLED)?=' "/boot/config-$kr" 2>/dev/null)"
+    elif [[ -r /proc/config.gz ]] && command -v zcat >/dev/null 2>&1; then
+        cfg="$(zcat /proc/config.gz 2>/dev/null | grep -E '^CONFIG_PSI(_DEFAULT_DISABLED)?=')"
+    fi
+    [[ -n "$cfg" ]] || { echo unknown; return 0; }
+    grep -q '^CONFIG_PSI=y' <<<"$cfg" || { echo absent; return 0; }
+    if grep -q '^CONFIG_PSI_DEFAULT_DISABLED=y' <<<"$cfg" && ! grep -qw 'psi=1' /proc/cmdline 2>/dev/null; then
+        echo off-by-default; return 0
+    fi
+    echo unknown
+}
+
+# journal_span_h — на сколько часов назад хватает journald (возраст самой старой записи).
+# Поток `[na portscan]` на публичной ноде (5/сек ≈ 50 МБ/сутки) вытесняет из журнала при
+# SystemMaxUse=300M всё остальное, и глубина падает ниже суток: разбор вчерашнего
+# инцидента становится невозможен, а на Debian 13 minimal journald — единственный
+# источник истории входов (issue #35). rc=1 = не измерено.
+journal_span_h() {
+    command -v journalctl >/dev/null 2>&1 || return 1
+    local first now
+    # -o short-unix отдаёт запись с самой старой первой строкой; head закрывает пайп
+    # сразу, поэтому цена не зависит от размера журнала.
+    first="$(_to 10 journalctl -q --no-pager -o short-unix 2>/dev/null | head -n1 | awk '{print $1}' | cut -d. -f1)"
+    [[ "$first" =~ ^[0-9]+$ ]] || return 1
+    now="$(date +%s 2>/dev/null)"; [[ "$now" =~ ^[0-9]+$ ]] || return 1
+    (( now > first )) || { echo 0; return 0; }
+    echo $(( (now - first) / 3600 ))
+}
+
+# portscan_log_lines — строк `[na portscan]` за текущую загрузку (сколько журнала съел
+# лог анти-скана). echo: число; rc=1 = не измерено (нет journalctl / сборка без `-g` /
+# не уложились в таймаут — частичный счёт лучше не выдавать за точный).
+portscan_log_lines() {
+    local n rc
+    command -v journalctl >/dev/null 2>&1 || return 1
+    # `-g` (grep по журналу) есть не во всех сборках systemd — спрашиваем help, а не
+    # пробный запуск: пустой результат пробы неотличим от «опция не поддержана».
+    _to 5 journalctl --help 2>/dev/null | grep -q -- '--grep' || return 1
+    n="$(_to 15 journalctl -b -k -g '\[na portscan\]' --no-pager -q 2>/dev/null | wc -l | tr -d ' ')"; rc=$?
+    # pipefail: timeout, убивший journalctl, отдаёт 124 — счёт неполный, врать не будем
+    [[ "$rc" -eq 124 ]] && return 1
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    echo "$n"
+}
+
+# cert_retired <path/to/fullchain> — серт acme.sh, снятый с renew. `acme.sh --remove`
+# оставляет каталог с сертом на диске, но переименовывает <domain>.conf →
+# <domain>.conf.removed: продлеваться он уже не будет, и его notAfter — гарантированная
+# ложная тревога по домену, которого в проде нет (issue #39).
+cert_retired() {
+    local d; d="$(dirname "$1")"
+    compgen -G "$d/*.conf" >/dev/null 2>&1 && return 1
+    compgen -G "$d/*.conf.removed" >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# Пути сертов: LE, acme.sh, фасадный selfsteal-каталог (/opt/<стек>/certs/...) и
+# NA_CERT_PATHS. Нестандартного /opt-каталога в v4.0 не было, и на selfsteal-ноде
+# сенсор отдавал cert_min_days=-1 — молчал ровно там, где серт и надо стеречь (#39).
+NA_CERT_GLOBS='/etc/letsencrypt/live/*/fullchain.pem /root/.acme.sh/*/fullchain.cer /opt/*/certs/*/fullchain.cer /opt/*/certs/*/fullchain.pem /opt/*/certs/fullchain.cer /opt/*/certs/fullchain.pem'
+
+# tls_listening — на :443/:8443 кто-то слушает? Если сертов при этом не нашли, сенсор
+# не «чист», а слеп — это warn, а не info (issue #39).
+tls_listening() {
+    ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE '[:.](443|8443)$'
+}
+
 # ─── JSON-режим (для флот-мониторинга: Zabbix/Prometheus/SSH-поллинг) ─────────
 # `diagnose.sh --json` печатает один машинно-читаемый объект и выходит. Read-only.
 emit_json() {
@@ -31,7 +197,8 @@ emit_json() {
     local fw fwm ab4 ab6 susp bl4 bl6 fl4 fl6 crowd ctg syndeg safety rebootn
     local u1 n1 s1 i1 w1 q1 sq1 st1 u2 n2 s2 i2 w2 q2 sq2 st2 dt steal out rtx rtxpct
     local nav host up load1 mempct wi wanrx wantx ip6def udperr
-    local rnst rnrc rnse fsa bla certd nowsec cf cend cends cd npd npfw
+    local rnst rnrc rnse fsa bla certd certf nowsec cf cend cends cd npd npfw
+    local mcpi jsp psl psist wdc csd tcpp wl_live wl_conf tmpv
     kern="$(uname -r)"; uname -r | grep -qi xanmod && xanmod=true || xanmod=false
     virt="$(detect_virt)"
     cc="$(val net.ipv4.tcp_congestion_control)"; qd="$(val net.core.default_qdisc)"
@@ -60,13 +227,17 @@ emit_json() {
     # режим файрвола из маркера protect (strict|open|skip; пусто = protect не гонялся
     # или старая версия без fw_mode) — панель отличает осознанный skip/open от «защиты нет»
     fwm="$(awk -F= '/^fw_mode=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"; fwm="${fwm:-}"
-    ab4="$(nft list set inet na_filter autoban_v4 2>/dev/null | grep -c timeout)"
-    ab6="$(nft list set inet na_filter autoban_v6 2>/dev/null | grep -c timeout)"
-    susp="$(nft list set inet na_filter suspect_v4 2>/dev/null | grep -c timeout)"
-    bl4="$(nft list set inet na_filter blocklist_v4 2>/dev/null | grep -coE '[0-9.]+')"
-    bl6="$(nft list set inet na_filter blocklist_v6 2>/dev/null | grep -c ':')"
-    fl4="$(nft list set inet na_filter na_fleet_v4 2>/dev/null | grep -coE '[0-9.]+')"
-    fl6="$(nft list set inet na_filter na_fleet_v6 2>/dev/null | grep -c ':')"
+    # Считаем АДРЕСА, а не строки вывода nft: в заголовке динамического набора всегда
+    # есть `flags dynamic,timeout` → `grep -c timeout` давал «1» на пустом наборе и +1
+    # (с 'expires' — +2) на непустом, и этот ряд уезжал прямо в Zabbix/Prometheus
+    # («autoban > 0» горел вечно). Общий хелпер — в lib/common.sh (issue #32/#36).
+    ab4="$(nft_set_count inet na_filter autoban_v4)"
+    ab6="$(nft_set_count inet na_filter autoban_v6)"
+    susp="$(nft_set_count inet na_filter suspect_v4)"
+    bl4="$(nft_set_count inet na_filter blocklist_v4)"
+    bl6="$(nft_set_count inet na_filter blocklist_v6)"
+    fl4="$(nft_set_count inet na_filter na_fleet_v4)"
+    fl6="$(nft_set_count inet na_filter na_fleet_v6)"
     command -v cscli >/dev/null 2>&1 && { systemctl is-active --quiet crowdsec && crowd=true || crowd=false; } || crowd=false
     if nft list table inet na_ctguard >/dev/null 2>&1; then
         local enf; enf="$(awk -F= '/^NA_CTG_ENFORCE/{print $2}' /etc/node-accelerator/ctguard.conf 2>/dev/null)"
@@ -101,10 +272,16 @@ emit_json() {
     # remnanode (Remnawave node-контейнер) — статус/рестарты/SPAWN_ERROR за час. Read-only.
     rnst="no-docker"; rnrc=0; rnse=0
     if command -v docker >/dev/null 2>&1; then
-        rnst="$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || echo absent)"; [[ -n "$rnst" ]] || rnst=absent
-        rnrc="$(docker inspect -f '{{.RestartCount}}' remnanode 2>/dev/null || echo 0)"; [[ "$rnrc" =~ ^[0-9]+$ ]] || rnrc=0
+        # `docker inspect -f` по несуществующему контейнеру (29.x) печатает в stdout
+        # ПУСТУЮ строку и только потом падает: идиома `… || echo absent` давала
+        # "\nabsent" — статус не совпадал с absent, а сырой перевод строки ломал ВЕСЬ
+        # JSON-документ (issue #27). Не смешиваем stdout с кодом возврата.
+        rnst="$(docker inspect -f '{{.State.Status}}' "$NA_NODE_CONTAINER" 2>/dev/null | tr -d '[:space:]')"
+        [[ -n "$rnst" ]] || rnst=absent
+        rnrc="$(docker inspect -f '{{.RestartCount}}' "$NA_NODE_CONTAINER" 2>/dev/null | tr -d '[:space:]')"
+        [[ "$rnrc" =~ ^[0-9]+$ ]] || rnrc=0
         if [[ "$rnst" != "absent" ]]; then
-            rnse="$(docker logs --since 1h remnanode 2>&1 | grep -c 'SPAWN_ERROR' || true)"; [[ "$rnse" =~ ^[0-9]+$ ]] || rnse=0
+            rnse="$(docker logs --since 1h "$NA_NODE_CONTAINER" 2>&1 | grep -c 'SPAWN_ERROR' || true)"; [[ "$rnse" =~ ^[0-9]+$ ]] || rnse=0
         fi
     fi
     # порт node-агента: факт (детект с ноды) vs заложенный в файрвол — рассинхрон
@@ -124,16 +301,44 @@ emit_json() {
     [[ -f "$STATE_DIR/blocklist.last" ]] && { cf="$(cat "$STATE_DIR/blocklist.last" 2>/dev/null)"; [[ "$cf" =~ ^[0-9]+$ ]] && bla=$(( nowsec - cf )); }
     # ближайший к истечению серт (−1 = нет openssl / сертов не нашли). NA_CERT_PATHS —
     # доп.пути через пробел; используются только в [ -f ] и openssl (без eval).
-    certd=-1
+    certd=-1; certf=""
     if command -v openssl >/dev/null 2>&1; then
-        for cf in /etc/letsencrypt/live/*/fullchain.pem /root/.acme.sh/*/fullchain.cer ${NA_CERT_PATHS:-}; do
+        # shellcheck disable=SC2086  # глобы и NA_CERT_PATHS обязаны раскрыться
+        for cf in $NA_CERT_GLOBS ${NA_CERT_PATHS:-}; do
             [[ -f "$cf" ]] || continue
+            cert_retired "$cf" && continue
             cend="$(openssl x509 -enddate -noout -in "$cf" 2>/dev/null | cut -d= -f2)"; [[ -n "$cend" ]] || continue
             cends="$(date -d "$cend" +%s 2>/dev/null)" || continue; [[ "$cends" =~ ^[0-9]+$ ]] || continue
             cd=$(( (cends - nowsec) / 86400 ))
-            { [[ "$certd" -lt 0 ]] || [[ "$cd" -lt "$certd" ]]; } && certd="$cd"
+            { [[ "$certd" -lt 0 ]] || [[ "$cd" -lt "$certd" ]]; } && { certd="$cd"; certf="$cf"; }
         done
     fi
+
+    # ── v4.1: метрики, которых мониторингу не хватало ──────────────────────────
+    # max_conn_per_ip: по тому же срезу, что и правило `ct count` (−1 = мерить не по чему)
+    mcpi=-1
+    tcpp="$(awk -F= '/^tcp_ports=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"
+    if [[ -n "${tcpp:-}" ]]; then
+        tmpv="$(conn_per_ip_max "$tcpp")" && [[ "$tmpv" =~ ^[0-9]+$ ]] && mcpi="$tmpv"
+    fi
+    # глубина журнала и объём лога анти-скана (−1 = не измерено)
+    jsp=-1; tmpv="$(journal_span_h)" && [[ "$tmpv" =~ ^[0-9]+$ ]] && jsp="$tmpv"
+    psl=-1; tmpv="$(portscan_log_lines)" && [[ "$tmpv" =~ ^[0-9]+$ ]] && psl="$tmpv"
+    psist="$(psi_state)"; psist="${psist:-unknown}"
+    # whitelist_drift_conf: адреса живого whitelist_v4, которых НЕТ в WHITELIST= из
+    # protect.conf — они не переживут ре-ран protect (−1 = conf нет, сверять не с чем)
+    wdc=-1
+    if [[ -f "$CONF_DIR/protect.conf" ]]; then
+        wl_live="$(nft_set_elems inet na_filter whitelist_v4 2>/dev/null | sed -E 's#/32$##' | sort -u)"
+        wl_conf="$(sed -nE 's/.*\{WHITELIST:=([^}]*)\}.*/\1/p' "$CONF_DIR/protect.conf" 2>/dev/null | tail -1 \
+                   | tr ',' '\n' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | sed -E 's#/32$##' | sort -u)"
+        wdc="$(comm -23 <(printf '%s\n' "$wl_live" | grep -v '^$' | sort -u) \
+                        <(printf '%s\n' "$wl_conf" | grep -v '^$' | sort -u) 2>/dev/null | grep -c .)"
+        [[ "$wdc" =~ ^[0-9]+$ ]] || wdc=-1
+    fi
+    # сохранённый conf пиннит дефолты той версии, при которой ноду настраивали
+    csd="$( { conf_stale_defaults "$CONF_DIR/protect.conf"; conf_stale_defaults "$CONF_DIR/optimize.conf"; } 2>/dev/null | grep -c .)"
+    [[ "$csd" =~ ^[0-9]+$ ]] || csd=0
 
     # Диск, inodes и лог-флуд: в человекочитаемом выводе они были, а во флот-мониторинге —
     # нет, поэтому самая частая авария (диск под завязку от нертотируемого лога) была не
@@ -144,6 +349,23 @@ emit_json() {
     dklogmax="$(find /var/lib/docker/containers -xdev -type f -name '*-json.log' -printf '%s\n' 2>/dev/null | sort -rn | head -1)"
     [[ "$dklogmax" =~ ^[0-9]+$ ]] || dklogmax=0
     lrt=0; systemctl is-active --quiet na-logrotate.timer 2>/dev/null && lrt=1
+    # Таймер ≠ станса: маски, отданные чужим стансам, тулкит не ротирует, а таймер при
+    # этом активен (issue #40). owned/ceded пишет optimize; пусто = станс/уступок нет.
+    lro="$(paste -sd' ' "$STATE_DIR/logrotate.owned" 2>/dev/null || true)"; lro="${lro:-}"
+    lrc="$(cut -f1 "$STATE_DIR/logrotate.ceded" 2>/dev/null | paste -sd' ' - || true)"; lrc="${lrc:-}"
+    lrcn="$(awk -F'\t' '$3=="none"' "$STATE_DIR/logrotate.ceded" 2>/dev/null | grep -c .)"; [[ "$lrcn" =~ ^[0-9]+$ ]] || lrcn=0
+    lro="$(json_escape "$lro")"; lrc="$(json_escape "$lrc")"
+
+    # Каждое строковое значение — через json_escape. Раньше каждое поле полагалось на то,
+    # что источник «и так чистый», и одного сырого перевода строки из docker хватило,
+    # чтобы уронить парсер на ВСЁМ документе (issue #27).
+    kern="$(json_escape "$kern")";   virt="$(json_escape "$virt")"
+    cc="$(json_escape "${cc:-}")";   qd="$(json_escape "${qd:-}")"
+    fwm="$(json_escape "$fwm")";     ctg="$(json_escape "$ctg")"
+    nav="$(json_escape "$nav")";     host="$(json_escape "$host")"
+    wi="$(json_escape "$wi")";       rnst="$(json_escape "$rnst")"
+    npd="$(json_escape "${npd:-}")"; npfw="$(json_escape "$npfw")"
+    psist="$(json_escape "$psist")"; certf="$(json_escape "$certf")"
 
     printf '{'
     printf '"kernel":"%s","xanmod":%s,"virt":"%s","cpu_steal_pct":%s,"tcp_retrans_pct":%s,' "$kern" "$xanmod" "$virt" "$steal" "$rtxpct"
@@ -157,8 +379,16 @@ emit_json() {
     printf '"remnanode_status":"%s","remnanode_restarts":%s,"remnanode_spawn_errors_1h":%s,' "$rnst" "$rnrc" "$rnse"
     printf '"node_port_detected":"%s","node_port_fw":"%s",' "$npd" "$npfw"
     printf '"fleet_sync_age_s":%s,"blocklist_age_s":%s,"cert_min_days":%s,' "$fsa" "$bla" "$certd"
-    printf '"disk_pct":%s,"inode_pct":%s,"log_max_bytes":%s,"docker_log_max_bytes":%s,"logrotate_timer":%s}\n' \
+    printf '"disk_pct":%s,"inode_pct":%s,"log_max_bytes":%s,"docker_log_max_bytes":%s,"logrotate_timer":%s,' \
         "$dsp" "$din" "$logmax" "$dklogmax" "$lrt"
+    # v4.1 (аудит флота): новые поля ТОЛЬКО в хвост — имена и порядок прежних читает
+    # мониторинг. −1 везде = «не измерено», а не «ноль».
+    printf '"max_conn_per_ip":%s,"journal_span_h":%s,"portscan_log_lines_boot":%s,"psi":"%s",' \
+        "$mcpi" "$jsp" "$psl" "$psist"
+    printf '"whitelist_drift_conf":%s,"conf_stale_defaults":%s,"cert_min_file":"%s",' \
+        "$wdc" "$csd" "$certf"
+    printf '"logrotate_owned_masks":"%s","logrotate_ceded_masks":"%s","logrotate_ceded_nocap":%s}\n' \
+        "$lro" "$lrc" "$lrcn"
 }
 if [[ "${1:-}" == "--json" ]]; then emit_json; exit 0; fi
 
@@ -452,6 +682,22 @@ if [[ "${DT:-0}" -gt 0 ]]; then
     else                             pass "CPU steal = ${STEAL}% (CPU ноды не отбирают)"
     fi
 fi
+# Сохранённый conf ПИННИТ дефолты той версии, при которой ноду настраивали: идиома
+# `: "${K:=v}"` из load_conf выигрывает у встроенного дефолта всегда. Когда новая
+# мажорная меняет дефолт по безопасности (CROWDSEC_STRICT 0→1 в v4.0), на уже настроенных
+# нодах он молча не применяется — ни ре-раном, ни апгрейдом тулкита, и узнать об этом
+# можно было только чтением конфига на каждом хосте (issue #34).
+CSD_N=0
+for _cf in "$CONF_DIR/protect.conf" "$CONF_DIR/optimize.conf"; do
+    [[ -f "$_cf" ]] || continue
+    while IFS='|' read -r _k _old _new _ver _why; do
+        [[ -n "$_k" ]] || continue
+        CSD_N=$((CSD_N+1))
+        wrn "$(basename "$_cf") пиннит устаревший дефолт: $_k=$_old (дефолт с v$_ver = $_new — $_why). Принять: NA_ADOPT_NEW_DEFAULTS=1 ре-ран $(basename "$_cf" .conf)"
+    done < <(conf_stale_defaults "$_cf")
+done
+[[ "$CSD_N" -eq 0 ]] && pass "conf модулей не пиннит устаревших дефолтов"
+unset _cf _k _old _new _ver _why
 
 # ─── Ядро / BBR ──────────────────────────────────────────────────────────────
 title "Ядро и congestion control"
@@ -600,7 +846,21 @@ if [[ -n "$NIC" ]]; then
     else
         pass "NIC без drop/error счётчиков"
     fi
-    systemctl is-active --quiet na-rps.service 2>/dev/null && pass "na-rps.service активен" || info "na-rps.service не запущен (ставится оптимизатором)"
+    # «Юнит активен» ≠ «RPS применён»: na-rps-setup определяет NIC по default route и при
+    # его отсутствии молча выходит нулём, а RemainAfterExit=yes фиксирует active (exited)
+    # навсегда. На буте это гонка с появлением маршрута, и v4.0 печатал ✔ рядом с ▲ «RPS
+    # выключен» — две строки в одной секции утверждали противоположное (issue #30).
+    if systemctl is-active --quiet na-rps.service 2>/dev/null; then
+        if [[ "$RPS_ON" == "1" ]]; then
+            pass "na-rps.service активен"
+        elif [[ "$CORES" -gt 1 ]] 2>/dev/null; then
+            wrn "na-rps.service active, но rps_cpus пуст — юнит отработал до появления default route (гонка на буте) и вышел нулём: systemctl restart na-rps.service; v4.1 optimize чинит юнит"
+        else
+            info "na-rps.service активен (1 ядро — размазывать нечего)"
+        fi
+    else
+        info "na-rps.service не запущен (ставится оптимизатором)"
+    fi
 else
     wrn "Основной интерфейс не определён"
 fi
@@ -623,9 +883,20 @@ if nft list table inet na_filter >/dev/null 2>&1; then
     else
         pass "nftables na_filter активна (policy drop на input)"
     fi
-    AB4=$(nft list set inet na_filter autoban_v4 2>/dev/null | grep -c 'timeout\|expires')
-    AB6=$(nft list set inet na_filter autoban_v6 2>/dev/null | grep -c 'timeout\|expires')
-    info "autoban: v4=$AB4  v6=$AB6"
+    # Считаем АДРЕСА, а не строки вывода nft: `flags dynamic,timeout` в заголовке
+    # матчился всегда (пустой набор = «1»), а на непустом `timeout\|expires` давал +2 к
+    # элементу. Вечная фантомная единица приучала считать строку шумом — и настоящий
+    # первый бан (в т.ч. адреса панели) терялся на её фоне (issue #32/#36).
+    AB4="$(nft_set_count inet na_filter autoban_v4)"; [[ "$AB4" =~ ^[0-9]+$ ]] || AB4=0
+    AB6="$(nft_set_count inet na_filter autoban_v6)"; [[ "$AB6" =~ ^[0-9]+$ ]] || AB6=0
+    if [[ $((AB4+AB6)) -gt 0 ]]; then
+        # оператору важно не «сколько», а «кто»: первый же бан может оказаться панелью
+        AB_LIST="$( { nft_set_elems inet na_filter autoban_v4; nft_set_elems inet na_filter autoban_v6; } 2>/dev/null | head -10 | paste -sd' ' -)"
+        AB_MORE=""; [[ $((AB4+AB6)) -gt 10 ]] && AB_MORE=" …ещё $((AB4+AB6-10))"
+        info "autoban: v4=$AB4  v6=$AB6 — $AB_LIST$AB_MORE"
+    else
+        info "autoban: v4=0  v6=0 (нода никого не банила)"
+    fi
     WLN=$(nft list set inet na_filter whitelist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l | tr -d ' ')
     WL6N=$(nft list set inet na_filter whitelist_v6 2>/dev/null | grep -c ':')
     if [[ "$WLN" -gt 0 || "$WL6N" -gt 0 ]]; then pass "whitelist: v4=$WLN v6=$WL6N адрес(ов)"
@@ -634,34 +905,69 @@ if nft list table inet na_filter >/dev/null 2>&1; then
     # существуют только в памяти ядра: при загрузке правила берутся из na_filter.nft, и
     # ре-ран protect или ребут молча их выбрасывает. Отсюда классическая авария — нода
     # исправна и доступна, а после перезагрузки панель до неё не достучалась.
+    # Сверяем ТРИ источника, потому что переживают они разное:
+    #   live == na_filter.nft   → переживёт РЕБУТ (правила грузятся из файла);
+    #   live ⊆ WHITELIST= conf  → переживёт РЕ-РАН protect (он перегенерирует .nft).
+    # v4.0 сверял только первую пару и объявлял здоровым адрес, который есть в файле и в
+    # памяти, но не в protect.conf: авто-whitelist SSH-IP в conf не пишется намеренно, то
+    # есть «раскурили ноду из транзитной сессии → адрес осел в .nft → диагностика
+    # довольна → первый ре-ран из другой сессии его молча выкинул» (issue #38).
+    # Наборы na_fleet_* / na_nodeport_wl_* здесь ни при чём — у них свой жизненный цикл.
     NFT_FILE="$CONF_DIR/na_filter.nft"
+    LIVE_WL="$(nft_set_elems inet na_filter whitelist_v4 2>/dev/null | sed -E 's#/32$##' | sort -u)"
     if [[ -r "$NFT_FILE" ]]; then
-        LIVE_WL="$(nft list set inet na_filter whitelist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u)"
-        FILE_WL="$(awk '/set whitelist_v4/,/}/' "$NFT_FILE" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u)"
-        DRIFT="$(comm -23 <(printf '%s\n' "$LIVE_WL") <(printf '%s\n' "$FILE_WL") 2>/dev/null | grep -c .)"
-        if [[ "${DRIFT:-0}" -gt 0 ]]; then
-            wrn "в живом whitelist_v4 на $DRIFT адрес(ов) больше, чем в $NFT_FILE — они пропадут при ре-ране/ребуте: $(comm -23 <(printf '%s\n' "$LIVE_WL") <(printf '%s\n' "$FILE_WL") 2>/dev/null | paste -sd' ' -)"
+        FILE_WL="$(awk '/set whitelist_v4/,/}/' "$NFT_FILE" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sed -E 's#/32$##' | sort -u)"
+        DRIFT_L="$(comm -23 <(printf '%s\n' "$LIVE_WL" | grep -v '^$' | sort -u) <(printf '%s\n' "$FILE_WL" | grep -v '^$' | sort -u) 2>/dev/null)"
+        DRIFT="$(printf '%s\n' "$DRIFT_L" | grep -c .)"; [[ "$DRIFT" =~ ^[0-9]+$ ]] || DRIFT=0
+        if [[ "$DRIFT" -gt 0 ]]; then
+            wrn "в живом whitelist_v4 на $DRIFT адрес(ов) больше, чем в $NFT_FILE — они пропадут при ребуте: $(printf '%s\n' "$DRIFT_L" | paste -sd' ' -)"
         else
             pass "whitelist в файле и в памяти совпадают (переживёт ребут)"
         fi
     fi
-    # датчик: насколько близко самый «жирный» источник к CONN_LIMIT (виден ли per-IP потолок)
+    if [[ -f "$CONF_DIR/protect.conf" ]]; then
+        # conf пишется идиомой `: "${WHITELIST:=…}"` — наивный `^WHITELIST=` не матчит
+        CONF_WL="$(sed -nE 's/.*\{WHITELIST:=([^}]*)\}.*/\1/p' "$CONF_DIR/protect.conf" 2>/dev/null | tail -1 \
+                   | tr ',' '\n' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sed -E 's#/32$##' | sort -u)"
+        CDRIFT_L="$(comm -23 <(printf '%s\n' "$LIVE_WL" | grep -v '^$' | sort -u) <(printf '%s\n' "$CONF_WL" | grep -v '^$' | sort -u) 2>/dev/null)"
+        CDRIFT="$(printf '%s\n' "$CDRIFT_L" | grep -c .)"; [[ "$CDRIFT" =~ ^[0-9]+$ ]] || CDRIFT=0
+        if [[ "$CDRIFT" -gt 0 ]]; then
+            SSH_IP_NOW="$(ssh_client_ip || true)"
+            CD_NOTE=""
+            [[ -n "$SSH_IP_NOW" ]] && printf '%s\n' "$CDRIFT_L" | grep -qxF "$SSH_IP_NOW" \
+                && CD_NOTE=" (среди них $SSH_IP_NOW — это IP текущей сессии)"
+            wrn "whitelist НЕ переживёт ре-ран protect: в WHITELIST= из protect.conf нет $CDRIFT адрес(ов) — $(printf '%s\n' "$CDRIFT_L" | paste -sd' ' -)$CD_NOTE. Добавлены транзитно (SSH-IP при прогоне protect) или руками; при ре-ране из другой сессии исчезнут. Закрепить: WHITELIST=…,$(printf '%s\n' "$CDRIFT_L" | head -1) ре-ран protect"
+        else
+            pass "whitelist ⊆ WHITELIST= в protect.conf (переживёт ре-ран protect)"
+        fi
+    fi
+    # Датчик per-IP потолка. Считаем ТОТ ЖЕ срез, что режет правило `ct count`: только
+    # входящие established на порты из tcp_ports=, без loopback и вайтлиста. v4.0 брал
+    # весь `ss state established` — loopback-пары nginx↔xray (тысячи, и каждая считалась
+    # дважды), исходящие плечи и вайтлист, до которых правило не доходит вовсе, — и
+    # предупреждение горело вечно, подталкивая поднять CONN_LIMIT, т.е. ослабить
+    # защиту от exhaustion ради несуществующей проблемы (issue #31).
     CLIM=$(nft list chain inet na_filter input 2>/dev/null | grep -oE 'ct count over [0-9]+' | head -1 | grep -oE '[0-9]+')
     if [[ -n "$CLIM" ]]; then
-        MAXIP=$(ss -tnH state established 2>/dev/null | awk '{print $NF}' | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//' | sort | uniq -c | sort -rn | head -1 | awk '{print $1+0}')
-        if [[ "${MAXIP:-0}" -ge $((CLIM*80/100)) ]]; then
-            wrn "макс. конн. с одного IP = ${MAXIP:-0} при CONN_LIMIT=$CLIM (≥80%) — за CGNAT возможны дропы, подними CONN_LIMIT"
+        TCPP_INST="$(awk -F= '/^tcp_ports=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"
+        if [[ -z "${TCPP_INST:-}" ]]; then
+            info "per-IP лимит $CLIM есть, но список портов правила неизвестен (в $STATE_DIR/protect.installed нет tcp_ports=) — датчик пропущен"
         else
-            pass "макс. конн. с одного IP = ${MAXIP:-0} / CONN_LIMIT $CLIM (запас есть)"
+            MAXIP="$(conn_per_ip_max "$TCPP_INST")"; [[ "$MAXIP" =~ ^[0-9]+$ ]] || MAXIP=0
+            if [[ "$MAXIP" -ge $((CLIM*80/100)) ]]; then
+                wrn "макс. входящих конн. с одного IP = $MAXIP при CONN_LIMIT=$CLIM (≥80%, порты $TCPP_INST) — за CGNAT возможны дропы, подними CONN_LIMIT"
+            else
+                pass "макс. входящих конн. с одного IP = $MAXIP / CONN_LIMIT $CLIM (порты $TCPP_INST, без loopback и вайтлиста — запас есть)"
+            fi
         fi
     fi
     # v3.0 компоненты
     if nft list set inet na_filter suspect_v4 >/dev/null 2>&1; then
-        SUSP=$(nft list set inet na_filter suspect_v4 2>/dev/null | grep -c timeout)
+        SUSP="$(nft_set_count inet na_filter suspect_v4)"; [[ "$SUSP" =~ ^[0-9]+$ ]] || SUSP=0
         info "ban-once: suspect (наблюдение) v4=$SUSP"
     fi
     if nft list set inet na_filter blocklist_v4 >/dev/null 2>&1; then
-        BL4=$(nft list set inet na_filter blocklist_v4 2>/dev/null | grep -coE '[0-9.]+')
+        BL4="$(nft_set_count inet na_filter blocklist_v4)"; [[ "$BL4" =~ ^[0-9]+$ ]] || BL4=0
         [[ "$BL4" -gt 0 ]] && pass "threat-блоклисты: v4=$BL4 записей (na-blocklist-update)" \
             || wrn "blocklist_v4 пуст — фиды не подтянулись? journalctl -t na-blocklist"
         if [[ -f "$STATE_DIR/blocklist.last" ]]; then
@@ -670,7 +976,7 @@ if nft list table inet na_filter >/dev/null 2>&1; then
         fi
     fi
     if nft list set inet na_filter na_fleet_v4 >/dev/null 2>&1; then
-        FL4=$(nft list set inet na_filter na_fleet_v4 2>/dev/null | grep -coE '[0-9.]+')
+        FL4="$(nft_set_count inet na_filter na_fleet_v4)"; [[ "$FL4" =~ ^[0-9]+$ ]] || FL4=0
         [[ "$FL4" -gt 0 ]] && pass "fleet-sync: $FL4 нод флота в whitelist" \
             || wrn "na_fleet пуст — панель/токен? journalctl -t na-fleet-sync"
         # свежесть: fail-safe last-known-good нем — протухший токен/сменившийся API
@@ -704,7 +1010,7 @@ fi
 # ctguard (отдельная таблица)
 if nft list table inet na_ctguard >/dev/null 2>&1; then
     ENF=$(awk -F= '/^NA_CTG_ENFORCE/{print $2}' /etc/node-accelerator/ctguard.conf 2>/dev/null)
-    PH4=$(nft list set inet na_ctguard phantom_v4 2>/dev/null | grep -c timeout)
+    PH4="$(nft_set_count inet na_ctguard phantom_v4)"; [[ "$PH4" =~ ^[0-9]+$ ]] || PH4=0
     [[ "${ENF:-0}" == 1 ]] && pass "ctguard ENFORCE активен (фантомов в блоке: $PH4)" \
         || info "ctguard в observe-режиме (только лог; NA_CTG_ENFORCE=1 для эвикта)"
 fi
@@ -744,9 +1050,12 @@ fi
 if command -v cscli >/dev/null 2>&1; then
     systemctl is-active --quiet crowdsec && pass "CrowdSec агент активен" || wrn "CrowdSec установлен, но не active"
     systemctl is-active --quiet crowdsec-firewall-bouncer && pass "firewall-bouncer активен" || wrn "bouncer не active"
+    # `cscli decisions list -o raw` печатает CSV С ЗАГОЛОВКОМ, и он попадал в счёт: на
+    # пустом списке выходило «decisions: 1» — читается как «один бан есть» (issue #32).
+    # Срезаем первую строку (`-o json` + jq не годится: jq на ноде не обязателен).
     # grep -vc печатает 0 И возвращает rc=1, когда совпадений нет → наивный `|| echo 0`
     # дописывал ВТОРОЙ ноль и строка выходила битой. Берём значение, потом валидируем.
-    DEC="$(cscli decisions list -o raw 2>/dev/null | grep -vc '^$')"
+    DEC="$(cscli decisions list -o raw 2>/dev/null | tail -n +2 | grep -vc '^$')"
     [[ "$DEC" =~ ^[0-9]+$ ]] || DEC=0
     info "CrowdSec decisions (активные баны): $DEC"
     nft list table ip crowdsec >/dev/null 2>&1 && info "таблица bouncer'а ip crowdsec присутствует (priority -10, раньше na_filter)"
@@ -786,24 +1095,30 @@ fi
 # ─── Стек ноды (remnanode) и сертификаты ─────────────────────────────────────
 title "Стек ноды и сертификаты"
 if command -v docker >/dev/null 2>&1; then
-    RN_ST="$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || echo absent)"
+    # `docker inspect -f` по несуществующему контейнеру (29.x) печатает в stdout ПУСТУЮ
+    # строку и только потом падает: `… || echo absent` давал "\nabsent", ветка absent
+    # была недостижима, и на панель-боксе/CDN-origin сенсор рапортовал ложный ✘
+    # «node-агент лежит» (issue #27/#33). Имя контейнера — ручка NA_NODE_CONTAINER.
+    RN_ST="$(docker inspect -f '{{.State.Status}}' "$NA_NODE_CONTAINER" 2>/dev/null | tr -d '[:space:]')"
+    [[ -n "$RN_ST" ]] || RN_ST=absent
     if [[ "$RN_ST" == "running" ]]; then
-        RN_RC="$(docker inspect -f '{{.RestartCount}}' remnanode 2>/dev/null || echo 0)"
-        RN_SE="$(docker logs --since 1h remnanode 2>&1 | grep -c 'SPAWN_ERROR' || true)"
+        RN_RC="$(docker inspect -f '{{.RestartCount}}' "$NA_NODE_CONTAINER" 2>/dev/null | tr -d '[:space:]')"
+        [[ "$RN_RC" =~ ^[0-9]+$ ]] || RN_RC=0
+        RN_SE="$(docker logs --since 1h "$NA_NODE_CONTAINER" 2>&1 | grep -c 'SPAWN_ERROR' || true)"
         if [[ "${RN_SE:-0}" -gt 0 ]]; then
-            bad "remnanode: running, но $RN_SE SPAWN_ERROR за час — xray не стартует (сверь node-address в панели: коллизия IP?)"
+            bad "$NA_NODE_CONTAINER: running, но $RN_SE SPAWN_ERROR за час — xray не стартует (сверь node-address в панели: коллизия IP?)"
         elif [[ "${RN_RC:-0}" -gt 3 ]]; then
-            wrn "remnanode: running, но RestartCount=$RN_RC — контейнер флапает (docker logs remnanode)"
+            wrn "$NA_NODE_CONTAINER: running, но RestartCount=$RN_RC — контейнер флапает (docker logs $NA_NODE_CONTAINER)"
         else
-            pass "remnanode: running (рестартов $RN_RC, SPAWN_ERROR за час нет)"
+            pass "$NA_NODE_CONTAINER: running (рестартов $RN_RC, SPAWN_ERROR за час нет)"
         fi
     elif [[ "$RN_ST" == "absent" ]]; then
-        info "remnanode: контейнера нет (нода без Remnawave node-агента? или иное имя)"
+        info "$NA_NODE_CONTAINER: контейнера нет (бокс без Remnawave node-агента — панель/CDN-origin? иначе задай NA_NODE_CONTAINER=<имя>)"
     else
-        bad "remnanode: статус '$RN_ST' (не running) — node-агент лежит"
+        bad "$NA_NODE_CONTAINER: статус '$RN_ST' (не running) — node-агент лежит"
     fi
 else
-    info "docker не установлен — сенсор remnanode пропущен"
+    info "docker не установлен — сенсор node-контейнера пропущен"
 fi
 # порт node-агента vs файрвол: рассинхрон (агент мигрировал 2222→3000, а strict-файрвол
 # в правилах держит старый порт) = панель молча теряет ноду. Сверяем ФАКТ (детект с ноды:
@@ -833,14 +1148,24 @@ fi
 # сертификаты: ближайший к истечению (Let's Encrypt / acme.sh / NA_CERT_PATHS)
 if command -v openssl >/dev/null 2>&1; then
     CERT_MIN=-1; CERT_MIN_F=""
-    for cf in /etc/letsencrypt/live/*/fullchain.pem /root/.acme.sh/*/fullchain.cer ${NA_CERT_PATHS:-}; do
+    # shellcheck disable=SC2086  # глобы и NA_CERT_PATHS обязаны раскрыться
+    for cf in $NA_CERT_GLOBS ${NA_CERT_PATHS:-}; do
         [[ -f "$cf" ]] || continue
+        cert_retired "$cf" && continue
         cend="$(openssl x509 -enddate -noout -in "$cf" 2>/dev/null | cut -d= -f2)"; [[ -n "$cend" ]] || continue
         cends="$(date -d "$cend" +%s 2>/dev/null)" || continue; [[ "$cends" =~ ^[0-9]+$ ]] || continue
         cdays=$(( (cends - $(date +%s)) / 86400 ))
         { [[ "$CERT_MIN" -lt 0 ]] || [[ "$cdays" -lt "$CERT_MIN" ]]; } && { CERT_MIN="$cdays"; CERT_MIN_F="$cf"; }
     done
-    if [[ "$CERT_MIN" -lt 0 ]]; then info "TLS-сертификатов в стандартных путях не найдено (задай NA_CERT_PATHS, если selfsteal-серт лежит иначе)"
+    if [[ "$CERT_MIN" -lt 0 ]]; then
+        # «сертов нет» и «сенсор слеп» были неотличимы и оба тихие: на selfsteal-ноде с
+        # сертом в /opt/<стек>/certs это молчание означало «о протухании не предупредим
+        # вообще» — ровно то, ради чего сенсор и нужен (issue #39).
+        if tls_listening; then
+            wrn "на :443/:8443 кто-то слушает, а TLS-сертификатов не нашёл — сенсор слеп: задай NA_CERT_PATHS='/путь/к/fullchain.pem …'"
+        else
+            info "TLS-сертификатов в стандартных путях не найдено (задай NA_CERT_PATHS, если selfsteal-серт лежит иначе)"
+        fi
     elif [[ "$CERT_MIN" -lt 7 ]];  then bad  "TLS-серт истекает через ${CERT_MIN} дн ($CERT_MIN_F) — renewal сломан?"
     elif [[ "$CERT_MIN" -lt 14 ]]; then wrn  "TLS-серт истекает через ${CERT_MIN} дн ($CERT_MIN_F) — проверь авто-renew"
     else pass "ближайший TLS-серт: ${CERT_MIN} дн до истечения ($CERT_MIN_F)"; fi
@@ -856,7 +1181,20 @@ if [[ -r /proc/pressure/cpu ]]; then
         A="$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg10=/){sub(/avg10=/,"",$i); print $i}}' "/proc/pressure/$r" 2>/dev/null)"; A="${A:-0}"
         if awk -v x="$A" 'BEGIN{exit !(x+0>=10)}'; then wrn "PSI $r some avg10=${A}% — заметный стол ядра"; else info "PSI $r some avg10=${A}%"; fi
     done
-else info "PSI недоступен (старое ядро)"; fi
+else
+    # Три состояния вместо двух: «ядро без CONFIG_PSI» ≠ «PSI собран, но выключен по
+    # умолчанию». XanMod (тот, что ставит сам тулкит) — второй случай, и v4.0 объяснял
+    # его «старым ядром» на ядре 6.18: сенсор давления молчал на 100% боксов, а строка
+    # выглядела как штатное «на этом железе не поддерживается» (issue #37).
+    case "$(psi_state)" in
+        off-by-default)
+            info "PSI выключен в сборке ядра (CONFIG_PSI_DEFAULT_DISABLED=y) — включи ENABLE_PSI=1 ре-раном optimize (допишет psi=1 в GRUB) + ребут" ;;
+        absent)
+            info "PSI не собран в этом ядре (нет CONFIG_PSI) — давление не измеряется" ;;
+        *)
+            info "PSI недоступен: /proc/pressure нет, конфиг ядра не прочитать" ;;
+    esac
+fi
 # Диск + inodes (лог-флуд жрёт inodes раньше места)
 DSP="$(df -P / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')"
 DIN="$(df -Pi / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')"
@@ -880,7 +1218,24 @@ DKBIG="$(find /var/lib/docker/containers -xdev -type f -name '*-json.log' -size 
 if ! command -v logrotate >/dev/null 2>&1; then
     wrn "logrotate не установлен — стансы в /etc/logrotate.d не выполняются вообще"
 elif systemctl is-active --quiet na-logrotate.timer 2>/dev/null; then
-    pass "ротация логов: часовой таймер активен"
+    # «Таймер активен» и «станса существует» — разные факты (issue #40): уступив все маски
+    # чужим стансам, optimize свою не создаёт, а таймер включает — и на трёх нодах флота
+    # диагностика светила ✔ при ротации, которую держала ручная станса weekly без maxsize.
+    LR_EN="$(sed -nE 's/.*\{ENABLE_LOGROTATE:=([^}]*)\}.*/\1/p' "$CONF_DIR/optimize.conf" 2>/dev/null | tail -1)"
+    if [[ -s "$STATE_DIR/logrotate.ceded" ]]; then
+        LR_CEDED="$(awk -F'\t' '{printf "%s%s → %s%s", (NR>1?", ":""), $1, $2, ($3=="none"?" (БЕЗ maxsize/size!)":($3=="unknown"?" (кап неизвестен)":""))}' "$STATE_DIR/logrotate.ceded" 2>/dev/null)"
+        LR_NOCAP="$(awk -F'\t' '$3=="none"' "$STATE_DIR/logrotate.ceded" 2>/dev/null | grep -c .)"
+        if [[ "${LR_NOCAP:-0}" -gt 0 ]]; then
+            wrn "ротация: таймер активен, но маски отданы чужим стансам, и у $LR_NOCAP из них НЕТ капа по размеру: $LR_CEDED — добавь maxsize в чужую стансу или сузь NA_LOG_PATHS (ре-ран optimize)"
+        else
+            wrn "ротация: таймер активен, но часть масок ротируют чужие стансы (у них кап есть): $LR_CEDED"
+        fi
+        [[ -s "$STATE_DIR/logrotate.owned" ]] && info "наша станса держит: $(paste -sd' ' "$STATE_DIR/logrotate.owned" 2>/dev/null)"
+    elif [[ "${LR_EN:-1}" == "1" && ! -s /etc/logrotate.d/na-node-logs ]]; then
+        wrn "ротация: таймер активен, а стансы /etc/logrotate.d/na-node-logs нет — тулкит ничего не ротирует (ре-ран optimize)"
+    else
+        pass "ротация логов: часовой таймер активен, станса на месте$( [[ -s "$STATE_DIR/logrotate.owned" ]] && echo " ($(paste -sd' ' "$STATE_DIR/logrotate.owned" 2>/dev/null))")"
+    fi
 else
     info "часовой таймер ротации не активен — работает только суточный logrotate.timer (maxsize проверяется раз в сутки)"
 fi
@@ -894,6 +1249,27 @@ if command -v logrotate >/dev/null 2>&1; then
         wrn "logrotate: $LRERR — станса пропускается, na-logrotate.service уйдёт в failed"
     else
         pass "logrotate: весь набор станс разбирается без ошибок"
+    fi
+fi
+# Ретеншен журнала ВО ВРЕМЕНИ. Датчик по объёму (выше) спокоен, когда логи капнуты, но
+# journald при SystemMaxUse=300M и логе анти-скана на 5/сек (~432 000 строк = ~50 МБ в
+# сутки) вытесняет всё остальное и живёт меньше суток: разбор вчерашнего инцидента уже
+# невозможен, а на Debian 13 minimal journald — единственный источник истории входов
+# (issue #35). Меряем возраст самой старой записи, а не размер.
+JSPAN="$(journal_span_h)" || JSPAN=""
+if [[ "$JSPAN" =~ ^[0-9]+$ ]]; then
+    if [[ "$JSPAN" -lt 48 ]]; then
+        wrn "журнал вмещает менее 48ч (самая старая запись ${JSPAN}ч назад) — форензика вчерашнего инцидента уже недоступна: снизь PORTSCAN_LOG_RATE (ре-ран protect) или подними SystemMaxUse"
+    else
+        info "глубина журнала: ${JSPAN}ч (~$((JSPAN/24)) сут)"
+    fi
+fi
+PSLINES="$(portscan_log_lines)" || PSLINES=""
+if [[ "$PSLINES" =~ ^[0-9]+$ ]]; then
+    if [[ "$PSLINES" -gt 100000 ]]; then
+        wrn "строк [na portscan] за текущую загрузку: $PSLINES — лог анти-скана вытесняет журнал (бан работает по счётчикам сета, а не по строкам лога: снизь PORTSCAN_LOG_RATE)"
+    else
+        info "строк [na portscan] за текущую загрузку: $PSLINES"
     fi
 fi
 # Инциденты ядра/сервисов

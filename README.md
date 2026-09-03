@@ -30,7 +30,10 @@
   сертификат). Штатной ротации мало: `maxsize` проверяется только в момент запуска logrotate, а тот
   суточный, поэтому файл проскакивает лимит между прогонами — наблюдалось превышение заявленного
   капа в девять раз. Ставится сам пакет `logrotate` (на минимальных образах его нет, и станса лежит
-  мёртвым грузом), станса на пути ноды и `na-logrotate.timer` с часовым прогоном.
+  мёртвым грузом), станса на пути ноды и `na-logrotate.timer` с часовым прогоном. Маску, которую уже
+  держит чужая станса, тулкит отдаёт ей (спор решает сам `logrotate`), **сам проверяет в ней
+  `maxsize`/`size`** и пишет факт уступки в состояние — `na-diagnose` показывает, кто ротирует и есть ли
+  кап, вместо зелёного «таймер активен».
 
 ### 🛡 Защита (`scripts/protect.sh`)
 `nftables`-движок в **своей** таблице `inet na_filter` (не `flush ruleset` — сосуществует с CrowdSec и Docker):
@@ -83,10 +86,10 @@
 - **Персист конфига** — ре-ран без ENV не сбрасывает поднятые под ноду ручки.
 
 ### 🩺 Диагностика (`scripts/diagnose.sh`)
-Read-only отчёт: ядро/BBR, sysctl, лимиты, conntrack, NIC/RPS, swap/THP/governor, firewall, CrowdSec, порты, RTT — с итогом ✔/▲/✘ и рекомендациями. Плюс сенсоры **стека ноды**: контейнер `remnanode` (статус/рестарты/`SPAWN_ERROR` за час — ловит коллизию node-address в панели), **рассинхрон порта node-агента с файрволом** (агент слушает `:3000`, а strict-правила держат `:2222` → «нода недоступна» для панели; в отчёте — с командой пожарного фикса, в `--json` — `node_port_detected`/`node_port_fw`), **сроки TLS-сертификатов** (LE/acme.sh; свои пути — `NA_CERT_PATHS="глоб1 глоб2"`), **свежесть fleet-sync/blocklist**, IPv6 default-route, UDP `RcvbufErrors` (QUIC/Hysteria2). После установки доступна как команда **`na-diagnose`** (`--json` для мониторинга/панели — теперь с `na_version`, `hostname`, `uptime_s`, `load1`, `mem_used_pct`, WAN rx/tx-байтами; `--retrans [--window N]` — разбор причин TCP-retransmits).
+Read-only отчёт: ядро/BBR, sysctl, лимиты, conntrack, NIC/RPS, swap/THP/governor, firewall, CrowdSec, порты, RTT — с итогом ✔/▲/✘ и рекомендациями. Плюс сенсоры **стека ноды**: контейнер `remnanode` (статус/рестарты/`SPAWN_ERROR` за час — ловит коллизию node-address в панели), **рассинхрон порта node-агента с файрволом** (агент слушает `:3000`, а strict-правила держат `:2222` → «нода недоступна» для панели; в отчёте — с командой пожарного фикса, в `--json` — `node_port_detected`/`node_port_fw`), **сроки TLS-сертификатов** (LE/acme.sh/`/opt/*/certs`; серты, снятые с renew в acme.sh, не считаются; свои пути — `NA_CERT_PATHS="глоб1 глоб2"`), **whitelist в трёх местах** (живой сет vs `na_filter.nft` vs `protect.conf`: адрес, который переживёт ребут, но не ре-ран `protect`, называется по имени), **датчик `CONN_LIMIT` по тому же срезу, что и правило** (только входящие на сервисные порты, без loopback/whitelist — раньше на ноде с внутренним nginx он горел всегда), **PSI** (различает «не собран», «выключен в сборке ядра» и «работает»), **ретеншен journald в часах**, **замороженные дефолты в сохранённом конфиге**, **свежесть fleet-sync/blocklist**, IPv6 default-route, UDP `RcvbufErrors` (QUIC/Hysteria2). После установки доступна как команда **`na-diagnose`** (`--json` для мониторинга/панели — теперь с `na_version`, `hostname`, `uptime_s`, `load1`, `mem_used_pct`, WAN rx/tx-байтами; `--retrans [--window N]` — разбор причин TCP-retransmits).
 
 ### 🔥 Форензика атак (`scripts/na-report.sh`)
-Read-only: кто/откуда/чем/когда — из журнала ядра, nft-сетов и CrowdSec. **`na-report`** (человекочитаемо) или **`na-report --json`**: `drops_by_reason`, `timeline`, `top_ips` с вердиктом, `top_asn` (ASN/гео — best-effort через Team Cymru whois). Флаги: `--hours N`, `--top N`, `--ip <addr>`.
+Read-only: кто/откуда/чем/когда — из журнала ядра, nft-сетов и CrowdSec. **`na-report`** (человекочитаемо) или **`na-report --json`**: `drops_by_reason`, `timeline`, `top_ips` с вердиктом, `top_asn` (ASN/гео — best-effort через Team Cymru whois). Флаги: `--hours N`, `--top N`, `--ip <addr>`. Журнал читается по всем загрузкам (`-b all`), а не с момента ребута; в шапке — фактическая глубина журнала (`journal_span_h`), чтобы «событий мало» не путать с «журнал вытеснен».
 
 ---
 
@@ -118,11 +121,11 @@ curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/ins
 
 # прод-режим: пиньте тег через NA_REF — компрометация ветки main тогда не утечёт
 # сразу на весь флот (скрипты тянутся из того же тега):
-export NA_REF=v4.0.1
+export NA_REF=v4.1.1
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 
 # максимум: + проверка minisign-подписей модулей (подписи лежат в дереве с v3.6):
-export NA_REF=v4.0.1 NA_REQUIRE_SIG=1 \
+export NA_REF=v4.1.1 NA_REQUIRE_SIG=1 \
        NA_MINISIGN_PUBKEY="RWQrJghT9nkdBC3ntiEXF29zrS8o429WhObHKq6I7CKoftVDhQBrBscu"
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 ```
@@ -147,7 +150,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `SSH_PORT` | авто-детект | порт(ы) SSH через запятую. Детект: активный `ssh.socket`/`sshd.socket` → `sshd -T` (учитывает `sshd_config.d/*`) → `ss` → `sshd_config`. Порт текущей SSH-сессии добавляется к правилам автоматически + warn |
 | `TCP_PORTS` / `UDP_PORTS` | `443,2087` | сервисные порты |
 | `NODE_PORT` | `auto` | порт(ы) node-agent через запятую. `auto` — детект с ноды (env контейнера `remnawave/node` → `.env` → `ss`; агент молчит → прошлый детект, иначе оба дефолта `2222,3000`). Явный порт ≠ факту → правила на оба + warn |
-| `WHITELIST` | _пусто_ | IP/CIDR (v4+v6) панели/мониторинга — никогда не банятся |
+| `WHITELIST` | _пусто_ | IP/CIDR (v4+v6) панели/мониторинга — никогда не банятся. Это **полный обход** защиты (accept раньше автобана/CrowdSec/лимитов), а не «доверенный список»: префиксы шире `/29` (v6 — `/64`) вызывают предупреждение; дубли и `/32` нормализуются перед записью в правила |
 | `SYN_RATE`/`SYN_BURST` | `200`/`400` | **per-IP** новых TCP-конн./сек на порт |
 | `UDP_RATE`/`UDP_BURST` | `200`/`400` | **per-IP** UDP пакетов/сек |
 | `UDP_BULK_PORTS` | _пусто_ | порты объёмного UDP-туннеля (Hysteria2/TUIC). Общий `UDP_RATE` — это потолок около 2 Мбит/с: он душит туннель, клиент ретранслитит и видит огромную задержку. Порт должен быть и в `UDP_PORTS` |
@@ -158,6 +161,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `SSH_BAN_TIME`/`PORTSCAN_BAN_TIME` | `24h`/`1h` | сроки бана |
 | `ENABLE_PORTSCAN_BAN` | `1` | автобан за скан закрытых портов |
 | `PORTSCAN_RATE`/`PORTSCAN_BURST` | `15`/`30` | порог скана (SYN на закрытые порты/мин, per-IP) до бана — ниже порога просто дроп, без бана |
+| `PORTSCAN_LOG_RATE`/`PORTSCAN_LOG_BURST` | `60`/`30` | сколько строк `[na portscan]` в минуту уходит в journald (до v4.1 — `5/second` ≈ 432 000 строк/сутки: на публичной ноде журнал в 300M жил меньше суток и форензика старше вчера была невозможна). Бан работает по счётчикам, не по логу; `0` — лог анти-скана не ставить. `protect` считает суточный бюджет против капа journald и предупреждает, если он больше 30% |
 | `ENABLE_CROWDSEC` | `1` | ставить CrowdSec + bouncer |
 | `CROWDSEC_STRICT` | `1` | только пиннингованный APT-репо; не поднялся → CrowdSec пропускается. `0` возвращает `curl\|bash`-фоллбэк, который атакующий может форсировать, сделав репозиторий недоступным |
 | `ENABLE_SYNPROXY` | `0` | nft synproxy на сервисные порты (advanced). На VPN-relay избыточен — syncookies + per-IP ct-лимиты уже дают анти-спуф; включать под подтверждённый спуф-SYN-флуд |
@@ -165,6 +169,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `SAFETY_DELAY` | `300` | сек до авто-сброса правил, если не подтвердить SSH. Сброс снимает и таблицу, и автозагрузку (`na-firewall.service`) — иначе локаут вернулся бы ребутом |
 | `FLEET_SYNC_INTERVAL` | `5min` | интервал fleet-sync (персистится; `na-diagnose` считает свежесть по нему, а не по дефолту) |
 | `NA_NO_LOCK` | `0` | `1` — не брать flock (по умолчанию параллельный второй прогон отказывается стартовать) |
+| `NA_ADOPT_NEW_DEFAULTS` | `0` | `1` — принять новые дефолты тулкита разом там, где сохранённый конфиг пиннит старый (см. [Сохранённый конфиг и смена дефолтов](#сохранённый-конфиг-и-смена-дефолтов)). Работает и для `optimize` |
 | `DRY_RUN` | `0` | `1` — только сгенерировать + `nft -c`, не применять |
 | `ENABLE_BANONCE` | `1` | двухступенчатый автобан (suspect→confirmed), анти-CGNAT-FP |
 | `SUSPECT_TIME` | `30m` | окно наблюдения за «подозреваемым» (ban-once) |
@@ -182,7 +187,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `NA_CTG_PHANTOM_MIN` / `NA_CTG_LIVE_FLOOR` | `4000` / `2` | порог conntrack-холдера / порог живых сокетов. `LIVE_FLOOR` подбирают по observe-режиму: у обычных клиентов бывает 1–2 живых сокета при заметном conntrack |
 | `NA_CTG_BANTIME` / `NA_CTG_INTERVAL` / `NA_CTG_COARSE_MULT` | `15m` / `20s` / `3` | срок эвикта / период проверки / во сколько раз conntrack должен превышать число живых сокетов, чтобы вообще запускать разбор |
 
-`optimize.sh`: `ENABLE_XANMOD=1`, `XANMOD_FLAVOR=lts|main|edge|rt`, `XANMOD_PKG=...`, `REMNAWAVE_SWAP_SIZE=2G`, `TCP_ECN_MODE=2` (0/1/2), `DISABLE_TFO=0`, `CT_EST_TIMEOUT=7440` (conntrack established-timeout, сек; ↑ напр. до `14400` для idle-туннелей/мостов без частого keepalive), `QDISC=fq|fq_codel|cake` (cake — против bufferbloat на слабых аплинках; сравнивай A/B), `ENABLE_MSS_CLAMP=0` (для routed/WireGuard-нод), `SETUP_NO_ZRAM=0`, `ENABLE_LOGROTATE=1` + `NA_LOG_PATHS`/`NA_LOG_MAXSIZE=200M`/`NA_LOG_ROTATE=4`/`NA_LOG_INTERVAL=hourly` (ротация файловых логов ноды, см. ниже), `NA_REMNANODE_ENV=/opt/remnanode/.env` (откуда брать порт агента), `NA_CERT_PATHS` (доп. сертификаты для сенсора срока). Буферы/conntrack/somaxconn — **tier-aware** (масштаб от RAM).
+`optimize.sh`: `ENABLE_XANMOD=1`, `XANMOD_FLAVOR=lts|main|edge|rt`, `XANMOD_PKG=...`, `REMNAWAVE_SWAP_SIZE=2G`, `TCP_ECN_MODE=2` (0/1/2), `DISABLE_TFO=0`, `CT_EST_TIMEOUT=7440` (conntrack established-timeout, сек; ↑ напр. до `14400` для idle-туннелей/мостов без частого keepalive), `QDISC=fq|fq_codel|cake` (cake — против bufferbloat на слабых аплинках; сравнивай A/B), `ENABLE_MSS_CLAMP=0` (для routed/WireGuard-нод), `SETUP_NO_ZRAM=0`, `ENABLE_LOGROTATE=1` + `NA_LOG_PATHS`/`NA_LOG_MAXSIZE=200M`/`NA_LOG_ROTATE=4`/`NA_LOG_INTERVAL=hourly` (ротация файловых логов ноды, см. ниже), `ENABLE_PSI=0` (`1` — дописать `psi=1` в `GRUB_CMDLINE_LINUX_DEFAULT`: XanMod и стоковые ядра Debian собраны с `CONFIG_PSI_DEFAULT_DISABLED=y`, без этого `/proc/pressure` нет и сенсор давления в `na-diagnose` слеп; учёт PSI не бесплатен для планировщика, поэтому opt-in; ребут), `NA_JOURNAL_MAX_USE=300M` (кап journald), `NA_REMNANODE_ENV=/opt/remnanode/.env` (откуда брать порт агента), `NA_NODE_CONTAINER=remnanode` (имя контейнера node-агента для сенсора `na-diagnose`), `NA_CERT_PATHS` (доп. сертификаты для сенсора срока). Буферы/conntrack/somaxconn — **tier-aware** (масштаб от RAM).
 `XANMOD_PROBE=1` — проверить, что репозиторий+ключ+сборка ядра резолвятся на этой ОС, **без установки** (для CI и быстрой проверки совместимости).
 
 ---
@@ -244,6 +249,24 @@ sudo ENABLE_CTGUARD=1 NA_CTG_ENFORCE=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/p
 > небольшого набора upstream-адресов, и per-IP лимиты (`CONN_LIMIT`/`SYN_RATE`) начнут их
 > резать. Посмотри кандидатов через `na-fw-top-talkers` и занеси upstream-диапазоны в
 > `WHITELIST=` — whitelist стоит выше всех лимитов.
+
+## Сохранённый конфиг и смена дефолтов
+
+Эффективные параметры каждого прогона сохраняются в `/etc/node-accelerator/{protect,optimize}.conf`
+идиомой `: "${KEY:=value}"` — ре-ран без ENV не сбрасывает то, что оператор задал под ноду
+(`WHITELIST`, `CONN_LIMIT`, `NODE_PORT`…). Обратная сторона: файл так же пиннит и **дефолты той
+версии, при которой ноду настраивали**, и встроенный дефолт новой версии не может выиграть у
+записанного никогда. Ужесточение по безопасности (например, `CROWDSEC_STRICT` `0→1` в v4.0) на уже
+настроенных нодах молча не применялось.
+
+С v4.1 тулкит различает «оператор задал» и «записан тогдашний дефолт»: ключи, пришедшие из ENV,
+помечаются в файле маркером `# explicit: KEY`; ключ без маркера, пиннящий старый дефолт, — заморозка,
+о которой `protect`/`optimize` печатают `[!] conf: KEY=old записан старой версией, а дефолт с vX = new…`,
+а `na-diagnose` — отдельный ▲ (в `--json` — `conf_stale_defaults`). Принять новые дефолты разом:
+`NA_ADOPT_NEW_DEFAULTS=1` при ре-ране; оставить старое осознанно: задать `KEY=old` в ENV один раз —
+маркер `explicit` переживёт последующие ре-раны.
+
+---
 
 ## Откат
 

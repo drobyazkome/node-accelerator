@@ -41,6 +41,43 @@ jobs:
         # решает вердикт самого logrotate, а не сравнение строк (#25), и глобы
         # NA_LOG_PATHS не раскрываются шеллом в явные пути.
         run: bash tests/logrotate-unit.sh
+      - name: common unit (счёт nft-сетов, json_escape, tty_tput, дрейф дефолтов conf)
+        # nft_set_count считает адреса, а не строки с 'timeout' (#32); json_escape не даёт
+        # переводу строки сломать --json (#27); tput молчит не в терминале (#28); conf
+        # с замороженным старым дефолтом → warn / NA_ADOPT_NEW_DEFAULTS=1 / маркер explicit (#34).
+        run: bash tests/common-unit.sh
+      - name: rps unit (ИСПОЛНЯЕТ сгенерированный na-rps-setup против стабов ip/nproc/sysfs)
+        # Юнит рапортовал success при неприменённом RPS: default route на буте появляется
+        # позже network-online.target, скрипт молча выходил нулём (#30). Теперь NIC из
+        # ExecStart, ожидание маршрута, фолбэк на физические, честный отказ; плюс #28 —
+        # в перенаправленном stdout нет escape-кодов курсора.
+        run: bash tests/rps-unit.sh
+      - name: psi unit (секция PSI optimize.sh + откат против стаба update-grub)
+        # ENABLE_PSI=1 дописывает psi=1 в GRUB_CMDLINE_LINUX_DEFAULT идемпотентно, =0 не
+        # трогает файл, rollback снимает ТОЛЬКО свой psi=1 (маркер) (#37).
+        run: bash tests/psi-unit.sh
+      - name: protect unit (na-fw-status / add_wl / сборка PORTSCAN / бюджет журнала против стабов)
+        # Счётчики na-fw-status считают адреса (#32); дубли и широкие CIDR в WHITELIST
+        # замечаются, /32 нормализуется, дедуп доезжает до nft/CrowdSec-yaml (#38);
+        # PORTSCAN_LOG_RATE=0 снимает лог, не бан; бюджет журнала считается (#35).
+        run: bash tests/protect-unit.sh
+      - name: diagnose unit (ИСПОЛНЯЕТ обе ветки diagnose против стабов docker/nft/ss/cscli/journalctl)
+        # --json валиден на хосте без контейнера node-агента (#27); счётчики autoban/suspect
+        # считают адреса (#32); датчик CONN_LIMIT без loopback/whitelist (#31); дрейф
+        # whitelist относительно protect.conf (#38); PSI три состояния (#37); серты в
+        # /opt/*/certs и снятые с renew (#39); глубина журнала (#35); RPS-юнит vs факт (#30).
+        run: bash tests/diagnose-unit.sh
+      - name: na-report читает журнал всех загрузок (-b all), не только текущей (#41)
+        # `-k` подразумевает `-b`: после ребута отчёт «за 24ч» молча становился «с момента
+        # загрузки» (×31 занижение на ноде флота). Оба вызова journalctl -k — с -b all.
+        run: |
+          N="$(grep -cE 'journalctl -k -b all --since' scripts/na-report.sh)"
+          [ "$N" -ge 2 ] || { echo "в na-report.sh journalctl -k без -b all (найдено $N из 2)"; exit 1; }
+          if grep -nE 'journalctl -k( |$)' scripts/na-report.sh | grep -vq -- '-b all'; then
+            echo "остался journalctl -k без -b all:"; grep -nE 'journalctl -k( |$)' scripts/na-report.sh | grep -v -- '-b all'; exit 1
+          fi
+          bash scripts/na-report.sh --json | grep -q '"journal_span_h":' || { echo "na-report --json без journal_span_h"; exit 1; }
+          echo "ok: -b all в обоих вызовах, journal_span_h в json"
 
   # ── Smoke-тесты на матрице дистрибутивов ────────────────────────────────────
   # Ловит ровно тот класс регрессий, из-за которых появился этот PR: установка
@@ -155,6 +192,42 @@ jobs:
           DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 FLEET_SYNC=1 \
             REMNAWAVE_NODES_URL=https://panel.example.com/fleet/nodes.json \
             bash scripts/protect.sh
+      - name: protect.sh DRY_RUN (PORTSCAN_LOG_RATE=0 — лог анти-скана не ставится, бан остаётся)
+        run: |
+          DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 PORTSCAN_LOG_RATE=0 bash scripts/protect.sh
+          F="$(ls -t /tmp/na_filter.*.nft | head -1)"
+          grep -q '\[na portscan\]' "$F" && { echo "лог анти-скана не должен ставиться при PORTSCAN_LOG_RATE=0"; exit 1; }
+          grep -q 'add @autoban_v4' "$F" || { echo "бан за скан пропал вместе с логом"; exit 1; }
+          echo "ok: лог снят, бан на месте"
+      - name: protect.sh DRY_RUN (дефолтный рейт лога анти-скана → nft -c) + отказ на кривом PORTSCAN_LOG_RATE
+        run: |
+          DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh
+          F="$(ls -t /tmp/na_filter.*.nft | head -1)"
+          grep -q 'limit rate 60/minute burst 30 packets log prefix "\[na portscan\] "' "$F" || { echo "лог анти-скана не на 60/minute burst 30"; exit 1; }
+          if PORTSCAN_LOG_RATE=abc DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh 2>/dev/null; then
+            echo "валидация НЕ сработала на кривом PORTSCAN_LOG_RATE"; exit 1
+          else echo "ok: кривой PORTSCAN_LOG_RATE отвергнут"; fi
+      - name: protect.sh DRY_RUN (дубль и широкий CIDR в WHITELIST → warn, в ruleset один адрес)
+        run: |
+          OUT="$(DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 \
+                 WHITELIST='203.0.113.7,203.0.113.7,203.0.113.0/24' bash scripts/protect.sh)"
+          echo "$OUT" | grep -q 'указан дважды' || { echo "дубль в WHITELIST не замечен"; exit 1; }
+          echo "$OUT" | grep -q 'ПОЛНЫЙ обход защиты' || { echo "широкий CIDR не замечен"; exit 1; }
+          F="$(ls -t /tmp/na_filter.*.nft | head -1)"
+          [ "$(grep -o '203\.0\.113\.7' "$F" | wc -l)" -eq 1 ] || { echo "дубль уехал в ruleset"; exit 1; }
+          echo "ok: дедуп + warn о широком CIDR"
+      - name: "protect.sh DRY_RUN — замороженный дефолт в protect.conf (#34): warn, adopt, explicit"
+        run: |
+          mkdir -p /etc/node-accelerator
+          printf '# node-accelerator — сохранённый конфиг ноды @ 2026-07-11\n: "${CROWDSEC_STRICT:=0}"\n' > /etc/node-accelerator/protect.conf
+          OUT="$(DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh)"
+          echo "$OUT" | grep -q 'CROWDSEC_STRICT=0 записан старой версией' || { echo "нет warn о замороженном дефолте"; exit 1; }
+          OUT="$(DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 NA_ADOPT_NEW_DEFAULTS=1 bash scripts/protect.sh)"
+          echo "$OUT" | grep -q 'CROWDSEC_STRICT=0 → 1 — принят дефолт' || { echo "NA_ADOPT_NEW_DEFAULTS=1 не принял дефолт"; exit 1; }
+          OUT="$(DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 CROWDSEC_STRICT=0 bash scripts/protect.sh)"
+          echo "$OUT" | grep -q 'записан старой версией' && { echo "warn при явном ENV — лишний"; exit 1; }
+          rm -f /etc/node-accelerator/protect.conf
+          echo "ok: дрейф дефолтов conf — warn / adopt / explicit"
       - name: CrowdSec-репозиторий резолвится (CROWDSEC_PROBE, без установки)
         run: CROWDSEC_PROBE=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh
       - name: install.sh persist → CLI na-diagnose + na-report создаются и отдают JSON

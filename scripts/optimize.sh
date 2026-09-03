@@ -16,6 +16,8 @@
 #   ENABLE_LOGROTATE=1 ротация файловых логов ноды + часовой таймер (0 = не трогать)
 #   NA_LOG_PATHS="/var/log/nginx/*.log /var/log/remnanode/*.log"   что ротировать
 #   NA_LOG_MAXSIZE=200M  NA_LOG_ROTATE=4  NA_LOG_INTERVAL=hourly
+#   NA_JOURNAL_MAX_USE=300M  потолок journald (публичную ноду 300M держат <суток)
+#   ENABLE_PSI=0      дописать psi=1 в cmdline → /proc/pressure (нужен reboot; 1 = вкл)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,8 +26,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Прячем курсор для прогресс-бара установки ядра ниже; гарантированно возвращаем его
 # при любом выходе, включая Ctrl-C, чтобы не оставить терминал с невидимым курсором.
-trap 'tput cnorm 2>/dev/null || true' EXIT
-trap 'tput cnorm 2>/dev/null || true; exit 130' INT
+# tty_tput, а не голый tput: tput решает по TERM, а не по isatty(1), и под
+# `nohup … > log` управляющие последовательности уезжали в лог раскатки (issue #28).
+trap 'tty_tput cnorm' EXIT
+trap 'tty_tput cnorm; exit 130' INT
 
 require_root
 detect_os
@@ -72,10 +76,16 @@ ENABLE_XANMOD="${ENABLE_XANMOD:-1}"
 XANMOD_FLAVOR="${XANMOD_FLAVOR:-lts}"
 BACKUP="$(backup_dir)"
 REBOOT_NEEDED=0
+# Причин ребута теперь может быть две (ядро и psi=1 в cmdline) — копим текстом,
+# чтобы в финале не обещать «установлено новое ядро» там, где его не ставили.
+REBOOT_WHY=""
 info "Бэкап изменяемых файлов: $BACKUP"
 
 # Прогресс-бар установки ядра (рисуется по APT::Status-Fd в install_xanmod).
+# Вне терминала не рисуем ВООБЩЕ: перерисовка живёт на \r и \033[K, а в файле это
+# мусор поверх строк лога (issue #28). Прогресс шага там несёт "Ставлю $p…" + итог.
 draw_progress_bar() {
+    is_tty || return 0
     local percent=$1 desc=$2 width=30 i bar=""
     local filled=$((percent * width / 100))
     local empty=$((width - filled))
@@ -84,6 +94,12 @@ draw_progress_bar() {
     local maxlen=35
     [[ ${#desc} -gt $maxlen ]] && desc="${desc:0:$((maxlen-3))}..."
     printf "\r[*] [%s] %3d%% (%s)\033[K" "$bar" "$percent" "$desc"
+}
+
+# Снять строку прогресс-бара и вернуть курсор. Всё «курсорное» — только в терминале.
+progress_end() {
+    if is_tty; then printf "\r\033[K"; fi
+    tty_tput cnorm
 }
 
 # ─── 1. Зависимости ──────────────────────────────────────────────────────────
@@ -190,7 +206,7 @@ install_xanmod() {
         apt-cache show "$p" >/dev/null 2>&1 || continue
         info "Ставлю $p (это надолго — компилит initramfs)…"
         err_log="$(mktemp)"
-        tput civis 2>/dev/null || true
+        tty_tput civis
         # APT::Status-Fd=1 → машинный прогресс в stdout; stdbuf -oL снимает буферизацию пайпа.
         # pkg НЕ трогаем в subshell справа от пайпа (там только отрисовка) — ставим в родителе.
         if DEBIAN_FRONTEND=noninteractive stdbuf -oL \
@@ -211,10 +227,10 @@ install_xanmod() {
                     esac
                 done
         then
-            printf "\r\033[K"; tput cnorm 2>/dev/null || true
+            progress_end
             rm -f "$err_log"; pkg="$p"; break
         else
-            printf "\r\033[K"; tput cnorm 2>/dev/null || true
+            progress_end
             warn "Сборка $p не установилась — пробую следующую. Хвост ошибки:"
             tail -n 3 "$err_log" >&2; rm -f "$err_log"
         fi
@@ -225,6 +241,7 @@ install_xanmod() {
     update-grub >/dev/null 2>&1 || true
     ok "XanMod установлен: $pkg (активируется ПОСЛЕ перезагрузки)"
     REBOOT_NEEDED=1
+    REBOOT_WHY="${REBOOT_WHY:+$REBOOT_WHY; }новое ядро XanMod ($pkg)"
     return 0
 }
 
@@ -261,6 +278,55 @@ if [[ "$ENABLE_XANMOD" == "1" ]]; then
     fi
 else
     info "ENABLE_XANMOD=0 — установка ядра пропущена"
+fi
+
+# ─── 2b. PSI: учёт давления CPU/памяти/IO (opt-in) ───────────────────────────
+# XanMod и стоковые ядра Debian собраны с CONFIG_PSI_DEFAULT_DISABLED=y: PSI в ядре
+# ЕСТЬ, но /proc/pressure не появляется без psi=1 в командной строке. То есть тулкит
+# сам ставит ядро, на котором его же сенсор давления слеп на 100% нод (issue #37).
+# Ручка opt-in и по умолчанию 0: учёт PSI не бесплатен для планировщика, а параметр
+# требует ребута. Идемпотентно: второй прогон psi=1 не дублирует.
+title "PSI (учёт давления, psi=1 в cmdline)"
+ENABLE_PSI="${ENABLE_PSI:-0}"
+[[ "$ENABLE_PSI" =~ ^[01]$ ]] || { warn "ENABLE_PSI='$ENABLE_PSI' — ожидается 0|1, беру 0"; ENABLE_PSI=0; }
+# Маркер «psi=1 в GRUB прописали МЫ» — только по нему rollback имеет право его снять.
+# Переносим с прошлого прогона: ре-ран не должен превратить нашу запись в «чужую».
+PSI_MARK=0
+if grep -qx 'psi=1' "$STATE_DIR/optimize.installed" 2>/dev/null; then PSI_MARK=1; fi
+
+if [[ "$ENABLE_PSI" != "1" ]]; then
+    # Осознанно НЕ снимаем уже стоящий psi=1: оператор мог включить его сам.
+    info "psi=1 не трогаю (ENABLE_PSI=1 — включить /proc/pressure, применится после reboot)"
+elif [[ ! -f /etc/default/grub ]]; then
+    info "нет /etc/default/grub (контейнер или загрузчик не GRUB) — psi=1 прописать некуда"
+else
+    # Конфиг ТЕКУЩЕГО ядра. Если ядро только что поставили — грузимся ещё на старом,
+    # и проверять нечего: лишний параметр загрузки безвреден, дописываем.
+    _kcfg="/boot/config-$(uname -r)"
+    _psi_line="$(grep -m1 -E '^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT="[^"]*"[[:space:]]*$' /etc/default/grub 2>/dev/null || true)"
+    if [[ "$REBOOT_NEEDED" != "1" && -r "$_kcfg" ]] && ! grep -q '^CONFIG_PSI=y' "$_kcfg" 2>/dev/null; then
+        info "в ядре нет CONFIG_PSI ($_kcfg) — psi=1 ничего не включит, пропускаю"
+    elif [[ -z "$_psi_line" ]]; then
+        warn "GRUB_CMDLINE_LINUX_DEFAULT не в ожидаемом виде KEY=\"…\" — psi=1 допиши вручную + update-grub"
+    elif [[ "$_psi_line" == *psi=1* ]]; then
+        ok "psi=1 уже в GRUB_CMDLINE_LINUX_DEFAULT"
+        [[ -r /proc/pressure/cpu ]] || { REBOOT_NEEDED=1; REBOOT_WHY="${REBOOT_WHY:+$REBOOT_WHY; }psi=1 в cmdline (сенсор давления)"; }
+    else
+        backup_file /etc/default/grub "$BACKUP"
+        # Дописываем ВНУТРЬ кавычек значения (за ними идёт остальной cmdline ядра).
+        # rc≠0 (ro-раздел/битые права) не должен ронять весь прогон — ниже проверяем факт.
+        sed -i -E 's/^([[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT="[^"]*)"[[:space:]]*$/\1 psi=1"/' /etc/default/grub || true
+        sed -i -E 's/^([[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=")[[:space:]]+/\1/' /etc/default/grub || true
+        if grep -qE '^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=.*psi=1' /etc/default/grub; then
+            PSI_MARK=1
+            update-grub >/dev/null 2>&1 || warn "update-grub не отработал — psi=1 доедет только после ручного update-grub"
+            ok "psi=1 дописан в GRUB_CMDLINE_LINUX_DEFAULT (/proc/pressure — после reboot)"
+            [[ -r /proc/pressure/cpu ]] || { REBOOT_NEEDED=1; REBOOT_WHY="${REBOOT_WHY:+$REBOOT_WHY; }psi=1 в cmdline (сенсор давления)"; }
+        else
+            warn "не смог дописать psi=1 в /etc/default/grub — оставил как было"
+        fi
+    fi
+    unset _kcfg _psi_line
 fi
 
 # ─── 3. Sysctl ───────────────────────────────────────────────────────────────
@@ -451,13 +517,53 @@ ok "nofile/nproc → 1048576 (shell-сессии подхватят после �
 
 # ─── 5. RPS/RFS/XPS — раскидываем softirq по ядрам ───────────────────────────
 title "RPS/RFS/XPS (масштабирование приёма пакетов по ядрам)"
+# Интерфейс детектим ЗДЕСЬ (раньше это делала секция 6 «NIC tuning»): имя нужно вшить
+# в ExecStart юнита RPS — на буте default route появляется ПОЗЖЕ network-online.target,
+# и автодетект в этот момент пуст (issue #30). Секция 6 берёт уже готовое значение.
+NIC="$(default_iface || true)"
 cat > /usr/local/sbin/na-rps-setup <<'RPS'
 #!/usr/bin/env bash
 # Включает Receive/Transmit Packet Steering на основном интерфейсе.
 # На virtio/single-queue VPS весь RX-softirq иначе висит на cpu0 — это потолок PPS.
-set -e
-NIC="${1:-$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')}"
-[ -z "$NIC" ] && exit 0
+#
+# Почему тут ожидание маршрута и два фолбэка: network-online.target на буте
+# достигается РАНЬШЕ, чем в таблице появляется default route (гонка с dhcpcd, та же,
+# что известна по /etc/resolv.conf). Прежняя версия в этот момент молча делала exit 0,
+# и юнит с RemainAfterExit навсегда оставался active (exited) с НЕприменённым RPS —
+# отказ был полностью бесшумным (issue #30). Теперь: имя NIC с момента optimize →
+# ожидание маршрута → все физические интерфейсы → отказ с ненулевым кодом.
+set -u
+want="${1:-}"
+sysdir=/sys/class/net
+
+nics=""
+# 1) Интерфейс, определённый при установке. После смены ядра он мог переименоваться
+#    (eth0→ens18) — тогда имени в /sys нет, и полагаться на него нельзя.
+if [ -n "$want" ] && [ -d "$sysdir/$want" ]; then
+    nics="$want"
+else
+    [ -n "$want" ] && echo "na-rps: интерфейс '$want' не найден — автодетект" >&2
+    # 2) Ждём default route до ~20 с: сеть на буте поднимается позже юнита.
+    i=0
+    while [ "$i" -lt 20 ]; do
+        nics="$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+        if [ -n "$nics" ]; then break; fi
+        i=$((i + 1))
+        sleep 1
+    done
+    # 3) Маршрута нет и через 20 с (IPv6-only, бридж без default) — берём ВСЕ
+    #    физические интерфейсы: RPS на лишнем NIC безвреден, отсутствующий — потолок PPS.
+    if [ -z "$nics" ]; then
+        for d in "$sysdir"/*/device; do
+            [ -e "$d" ] || continue
+            n="${d%/device}"; n="${n##*/}"
+            case "$n" in lo|veth*|docker*|br-*) continue;; esac
+            nics="${nics:+$nics }$n"
+        done
+        [ -n "$nics" ] && echo "na-rps: default route не появился за 20с — беру физические: $nics" >&2
+    fi
+fi
+
 ncpu="$(nproc)"
 # Битовая маска всех CPU в формате rps_cpus (группы по 32 бита, старшая первой).
 mask="$(awk -v n="$ncpu" 'BEGIN{
@@ -465,38 +571,59 @@ mask="$(awk -v n="$ncpu" 'BEGIN{
         v=(b>=32?4294967295:(2^b)-1);
         s=(s==""?sprintf("%x",v):sprintf("%x,%s",v,s)); } print (s==""?"0":s) }')"
 echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
-for q in /sys/class/net/"$NIC"/queues/rx-*; do
-    [ -e "$q/rps_cpus" ] && echo "$mask" > "$q/rps_cpus" 2>/dev/null || true
-    [ -e "$q/rps_flow_cnt" ] && echo 4096 > "$q/rps_flow_cnt" 2>/dev/null || true
+
+applied=0
+for NIC in $nics; do
+    [ -d "$sysdir/$NIC" ] || continue
+    for q in "$sysdir/$NIC"/queues/rx-*; do
+        [ -e "$q/rps_cpus" ] && echo "$mask" > "$q/rps_cpus" 2>/dev/null || true
+        [ -e "$q/rps_flow_cnt" ] && echo 4096 > "$q/rps_flow_cnt" 2>/dev/null || true
+    done
+    for q in "$sysdir/$NIC"/queues/tx-*; do
+        [ -e "$q/xps_cpus" ] && echo "$mask" > "$q/xps_cpus" 2>/dev/null || true
+    done
+    # Эта строка — маркер успеха в журнале: её отсутствие в `journalctl -u na-rps`
+    # означает, что RPS не применён, чем бы ни рапортовал статус юнита.
+    echo "na-rps: NIC=$NIC mask=$mask cpus=$ncpu"
+    applied=1
 done
-for q in /sys/class/net/"$NIC"/queues/tx-*; do
-    [ -e "$q/xps_cpus" ] && echo "$mask" > "$q/xps_cpus" 2>/dev/null || true
-done
-echo "na-rps: NIC=$NIC mask=$mask cpus=$ncpu"
+
+# Молчаливый exit 0 здесь и делал «зелёный юнит при выключенном RPS» — падаем честно,
+# юнит перезапустится (Restart=on-failure) и отказ будет виден в статусе.
+if [ "$applied" -ne 1 ]; then
+    echo "na-rps: no usable interface (default route not found, no physical NIC) — giving up" >&2
+    exit 1
+fi
 RPS
 chmod +x /usr/local/sbin/na-rps-setup
 
-cat > /etc/systemd/system/na-rps.service <<'EOF'
+# Restart= для Type=oneshot systemd принимает с v244 (в матрице поддержки минимум —
+# Debian 11 с 247 и Ubuntu 20.04 с 245, так что версию не гейтим). StartLimit* — чтобы
+# нода без сети не перезапускала юнит вечно: после 5 неудач он остаётся failed и виден.
+cat > /etc/systemd/system/na-rps.service <<EOF
 [Unit]
 Description=node-accelerator RPS/RFS/XPS tuning
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/sbin/na-rps-setup
+ExecStart=/usr/local/sbin/na-rps-setup ${NIC:-}
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable --now na-rps.service >/dev/null 2>&1 || true
-ok "RPS/RFS/XPS включены ($(nproc) ядер)"
+ok "RPS/RFS/XPS включены ($(nproc) ядер, NIC=${NIC:-автодетект на буте})"
 
 # ─── 6. NIC tuning ───────────────────────────────────────────────────────────
 title "NIC tuning (ring buffer, offloads)"
-NIC="$(default_iface || true)"
 if [[ -n "${NIC:-}" ]]; then
     cat > /etc/systemd/system/na-nic-tune.service <<EOF
 [Unit]
@@ -657,17 +784,24 @@ else
 fi
 
 # ─── 8. journald cap ─────────────────────────────────────────────────────────
+# Кап — ручка, а не константа: на публичной ноде поток логов фаервола (анти-скан)
+# съедает 300M меньше чем за сутки, и журнал перестаёт хранить историю, по которой
+# вообще разбирают инцидент — на minimal-образах он ЕДИНСТВЕННЫЙ её источник
+# (issue #35). Ноде, которую активно сканируют, ставь NA_JOURNAL_MAX_USE=1G.
 title "journald (ограничение логов)"
+NA_JOURNAL_MAX_USE="${NA_JOURNAL_MAX_USE:-300M}"
+[[ "$NA_JOURNAL_MAX_USE" =~ ^[0-9]+[KMG]?$ ]] \
+    || { warn "NA_JOURNAL_MAX_USE='$NA_JOURNAL_MAX_USE' — ожидается размер вида 300M/1G; беру 300M"; NA_JOURNAL_MAX_USE=300M; }
 mkdir -p /etc/systemd/journald.conf.d
-cat > /etc/systemd/journald.conf.d/na-size.conf <<'J'
+cat > /etc/systemd/journald.conf.d/na-size.conf <<J
 [Journal]
-SystemMaxUse=300M
+SystemMaxUse=$NA_JOURNAL_MAX_USE
 SystemKeepFree=500M
 SystemMaxFileSize=50M
 Compress=yes
 J
 systemctl restart systemd-journald
-ok "journald ≤ 300M"
+ok "journald ≤ $NA_JOURNAL_MAX_USE"
 
 # ─── 8b. Ротация файловых логов ноды ─────────────────────────────────────────
 # journald-cap выше держит только журнал systemd. Логи, которые пишут nginx и ядро ноды
@@ -690,8 +824,10 @@ NA_LOG_ROTATE="${NA_LOG_ROTATE:-4}"
 NA_LOG_INTERVAL="${NA_LOG_INTERVAL:-hourly}"
 LR_CONF=/etc/logrotate.d/na-node-logs
 
+LR_CEDED_N=0
 if [[ "$ENABLE_LOGROTATE" != "1" ]]; then
     info "ротация логов пропущена (ENABLE_LOGROTATE=0)"
+    rm -f "$STATE_DIR/logrotate.ceded" "$STATE_DIR/logrotate.owned" 2>/dev/null || true
 else
     [[ "$NA_LOG_MAXSIZE" =~ ^[0-9]+[kKMG]$ ]] || { err "NA_LOG_MAXSIZE='$NA_LOG_MAXSIZE' — ожидается размер вида 200M"; exit 1; }
     [[ "$NA_LOG_ROTATE"  =~ ^[0-9]+$ ]]       || { err "NA_LOG_ROTATE='$NA_LOG_ROTATE' — ожидается целое число"; exit 1; }
@@ -715,7 +851,7 @@ else
     # стансам — у них может быть сигнальный reload вместо copytruncate, им и владеть.
     # read -a, а не голый word-split: иначе шелл сам раскроет глобы по живым файлам,
     # и в стансу лягут ЯВНЫЕ пути — лог нового vhost'а никогда не начнёт ротироваться.
-    _want=(); _dup=()
+    _want=(); _dup=(); _dup_paths=""
     read -r -a _want <<<"$NA_LOG_PATHS"
 
     _na_lr_write() {
@@ -761,7 +897,7 @@ LRC
                 while IFS= read -r _f; do
                     [[ -n "$_f" ]] || continue
                     # shellcheck disable=SC2053  # маска без кавычек — намеренный glob-матч
-                    if [[ "$_f" == $_m ]]; then _hit=1; break; fi
+                    if [[ "$_f" == $_m ]]; then _hit=1; _dup_paths+="${_dup_paths:+$'\n'}$_f"; fi
                 done <<<"$_dupf"
                 if [[ "$_hit" -eq 1 ]]; then _dup+=("$_m"); else _keep+=("$_m"); fi
             done
@@ -776,14 +912,71 @@ LRC
         done
     fi
 
+    # Уступка — не конец истории (issue #40). Раньше модуль печатал «проверь, что там
+    # задан maxsize» и рапортовал зелёным, а na-diagnose видел только активный таймер:
+    # на трёх нодах флота ротацию держала ручная станса `weekly` без maxsize — то есть
+    # никакого капа не было, а всё выглядело настроенным. Теперь: ищем стансу-владельца,
+    # САМИ смотрим в ней maxsize/size, и пишем факт уступки в состояние —
+    # его показывает na-diagnose (текст и --json), а не только лог этого прогона.
+    #
+    # _na_lr_owner <путь> — файл в /etc/logrotate.d (кроме нашего), чья маска покрывает
+    # путь. Шапка стансы — строки, начинающиеся с «/», до «{»; кавычки снимаем.
+    _na_lr_owner() {
+        local f pat
+        for f in /etc/logrotate.d/*; do
+            [[ -f "$f" && "$f" != "$LR_CONF" ]] || continue
+            while IFS= read -r pat; do
+                [[ -n "$pat" ]] || continue
+                # shellcheck disable=SC2053  # маска без кавычек — намеренный glob-матч
+                if [[ "$1" == $pat ]]; then echo "$f"; return 0; fi
+            done < <(sed -nE 's/^[[:space:]]*(\/[^{]*).*/\1/p' "$f" 2>/dev/null | tr -d '"' | tr ' \t' '\n\n')
+        done
+        return 1
+    }
+    # _na_lr_cap <файл-стансы> — есть ли в стансе ограничение по размеру: maxsize (по
+    # размеру ИЛИ периоду) либо size (только по размеру). minsize капом НЕ является —
+    # он лишь запрещает ротировать мелкие файлы.
+    _na_lr_cap() { grep -qE '^[[:space:]]*(maxsize|size)[[:space:]]+[0-9]' "$1" 2>/dev/null; }
+
+    mkdir -p "$STATE_DIR"
+    : > "$STATE_DIR/logrotate.ceded.tmp"
+    for _m in "${_dup[@]}"; do
+        # владельца ищем по РЕАЛЬНЫМ путям, которые logrotate назвал дубликатами и
+        # которые покрыты этой маской: у чужой стансы маска может быть другой
+        _owner=""
+        while IFS= read -r _f; do
+            [[ -n "$_f" ]] || continue
+            # shellcheck disable=SC2053
+            [[ "$_f" == $_m ]] || continue
+            _owner="$(_na_lr_owner "$_f" || true)"; [[ -n "$_owner" ]] && break
+        done <<<"${_dup_paths:-}"
+        if [[ -z "$_owner" ]]; then
+            warn "маска $_m отдана чужой стансе, но владелец в /etc/logrotate.d не найден (станса в /etc/logrotate.conf?) — проверь, что там задан maxsize"
+            printf '%s\t%s\t%s\n' "$_m" "?" "unknown" >> "$STATE_DIR/logrotate.ceded.tmp"
+        elif _na_lr_cap "$_owner"; then
+            info "маска $_m уже покрыта чужой стансой $_owner — отдана ей (там есть maxsize/size — кап на размер работает)"
+            printf '%s\t%s\t%s\n' "$_m" "$_owner" "capped" >> "$STATE_DIR/logrotate.ceded.tmp"
+        else
+            # `|| true` обязателен: под set -e -o pipefail пустой grep ронял бы весь прогон
+            _period="$(grep -owE '(hourly|daily|weekly|monthly|yearly)' "$_owner" 2>/dev/null | head -1 || true)"
+            warn "маска $_m отдана чужой стансе $_owner: там ${_period:-период не задан} БЕЗ maxsize/size — размер логов ничем не ограничен; добавь в неё 'maxsize $NA_LOG_MAXSIZE' или сузь NA_LOG_PATHS"
+            printf '%s\t%s\t%s\n' "$_m" "$_owner" "none" >> "$STATE_DIR/logrotate.ceded.tmp"
+        fi
+    done
+    unset _owner _period
+    if [[ -s "$STATE_DIR/logrotate.ceded.tmp" ]]; then
+        mv -f "$STATE_DIR/logrotate.ceded.tmp" "$STATE_DIR/logrotate.ceded"
+    else
+        rm -f "$STATE_DIR/logrotate.ceded.tmp" "$STATE_DIR/logrotate.ceded"
+    fi
+    LR_CEDED_N="${#_dup[@]}"
     if [[ "${#_want[@]}" -gt 0 ]]; then
+        printf '%s\n' "${_want[@]}" > "$STATE_DIR/logrotate.owned"
         ok "стансa $LR_CONF: ${_want[*]} (maxsize $NA_LOG_MAXSIZE, rotate $NA_LOG_ROTATE)"
     else
-        info "все заданные пути уже покрыты другими стансами — свою не создаю"
+        rm -f "$STATE_DIR/logrotate.owned"
+        warn "все заданные пути уже покрыты чужими стансами — свою НЕ создаю: ротацию логов ноды держат они (см. выше, есть ли там maxsize); таймер ниже гоняет весь /etc/logrotate.conf, т.е. и их"
     fi
-    for _m in "${_dup[@]}"; do
-        warn "маска $_m уже покрыта чужой стансой в /etc/logrotate.d — отдана ей; проверь, что там задан maxsize"
-    done
 
     # Любая ЧУЖАЯ битая станса роняет весь прогон: logrotate печатает `error:`,
     # пропускает её и выходит с ненулевым кодом. Юнит ниже — Type=oneshot, значит
@@ -884,13 +1077,15 @@ backup=$BACKUP
 nic=${NIC:-none}
 xanmod=$([[ -f "$STATE_DIR/xanmod.pkg" ]] && cat "$STATE_DIR/xanmod.pkg" || echo none)
 reboot_needed=$REBOOT_NEEDED
+psi=$PSI_MARK
 EOF
 
 # Персист конфига оптимизатора → ре-ран без ENV не сбрасывает выбор сборки/флейвора.
 save_conf "$CONF_DIR/optimize.conf" \
     ENABLE_XANMOD XANMOD_FLAVOR REMNAWAVE_SWAP_SIZE \
     DISABLE_TFO TCP_ECN_MODE ENABLE_MSS_CLAMP SETUP_NO_ZRAM CT_EST_TIMEOUT QDISC \
-    ENABLE_LOGROTATE NA_LOG_PATHS NA_LOG_MAXSIZE NA_LOG_ROTATE NA_LOG_INTERVAL
+    ENABLE_LOGROTATE NA_LOG_PATHS NA_LOG_MAXSIZE NA_LOG_ROTATE NA_LOG_INTERVAL \
+    ENABLE_PSI NA_JOURNAL_MAX_USE
 
 title "ГОТОВО"
 ok "Оптимизатор применён."
@@ -902,7 +1097,15 @@ printf "    %-32s %s\n" "nf_conntrack_max:"   "$(sysctl -n net.netfilter.nf_conn
 printf "    %-32s %s\n" "file-max:"           "$(sysctl -n fs.file-max 2>/dev/null || echo n/a)"
 echo
 if [[ "$REBOOT_NEEDED" == "1" ]]; then
-    warn "УСТАНОВЛЕНО НОВОЕ ЯДРО XanMod — нужна ПЕРЕЗАГРУЗКА (reboot), чтобы BBRv3 заработал."
-    warn "После reboot проверь: uname -r  (должно содержать 'xanmod')."
+    warn "НУЖНА ПЕРЕЗАГРУЗКА (reboot): ${REBOOT_WHY:-изменения в параметрах загрузки}"
+    if [[ "$REBOOT_WHY" == *XanMod* ]]; then
+        warn "После reboot проверь: uname -r  (должно содержать 'xanmod') — тогда работает BBRv3."
+    fi
+    if [[ "$REBOOT_WHY" == *psi=1* ]]; then
+        warn "После reboot проверь: ls /proc/pressure  (сенсор давления в na-diagnose оживёт)."
+    fi
 fi
 warn "Часть лимитов применится после перелогина/reboot (DefaultLimit* для systemd-сервисов)."
+if [[ "${LR_CEDED_N:-0}" -gt 0 ]]; then
+    warn "РОТАЦИЯ ЛОГОВ: $LR_CEDED_N маск(и) отданы чужим стансам logrotate — тулкит их НЕ ротирует; кто и с каким капом: cat $STATE_DIR/logrotate.ceded (см. предупреждения секции «ротация логов ноды»)"
+fi

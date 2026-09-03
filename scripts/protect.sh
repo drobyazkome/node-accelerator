@@ -27,6 +27,8 @@
 #   CONN_LIMIT=2048                    макс. одновременных конн. с одного IP (ct count)
 #   SSH_RATE=6    SSH_BURST=5          per-IP новых SSH/мин до бана
 #   SSH_BAN_TIME=24h  PORTSCAN_BAN_TIME=1h
+#   PORTSCAN_LOG_RATE=60               строк [na portscan] в МИНУТУ в журнал (0 = не
+#   PORTSCAN_LOG_BURST=30              логировать вовсе; на бан не влияет — он по meter'ам)
 #   ENABLE_PORTSCAN_BAN=1  ENABLE_CROWDSEC=1  ENABLE_SYNPROXY=0
 #   CROWDSEC_STRICT=1                  ставить CrowdSec ТОЛЬКО из пиннингованного APT-репо;
 #                                      не поднялся — пропустить (0 = разрешить curl|bash)
@@ -95,6 +97,16 @@ PORTSCAN_BAN_TIME="${PORTSCAN_BAN_TIME:-1h}"
 # Порог автобана за скан: банить IP только если он бьёт по закрытым портам БЫСТРЕЕ
 # порога (реальный сканер). Одиночные шальные SYN из CGNAT-пула не банят весь оператор.
 PORTSCAN_RATE="${PORTSCAN_RATE:-15}"; PORTSCAN_BURST="${PORTSCAN_BURST:-30}"  # /minute, per-IP
+# Сколько строк `[na portscan]` в МИНУТУ пишем в журнал (единицы как у PORTSCAN_RATE).
+# До v4.1 тут было 5/second — до 432 000 строк в сутки. Вместе с journald-капом, который
+# ставит наш же optimize (SystemMaxUse=300M), это давало на публичной ноде ГЛУБИНУ
+# журнала меньше суток: скан вытеснял историю входов, а на Debian minimal journald —
+# единственный её источник (ни rsyslog, ни wtmp). Замер флота: 405 822 строки за буту,
+# журнал 291.8 МБ, самая старая запись — 20 часов назад (issue #35).
+# 60/минуту (≈1/с) хватает, чтобы увидеть скан и построить топ сканеров в na-report.
+# 0 = лог-правило анти-скана не ставится вовсе: САМ БАН от этого не меняется — он
+# работает по meter'ам (add @suspect / add @autoban), а не по строкам лога.
+PORTSCAN_LOG_RATE="${PORTSCAN_LOG_RATE:-60}"; PORTSCAN_LOG_BURST="${PORTSCAN_LOG_BURST:-30}"
 ENABLE_PORTSCAN_BAN="${ENABLE_PORTSCAN_BAN:-1}"
 ENABLE_CROWDSEC="${ENABLE_CROWDSEC:-1}"
 # CROWDSEC_STRICT=1 (дефолт с v4.0) — никакого curl|bash-фоллбэка: не поднялся
@@ -247,7 +259,7 @@ _is_duration() { [[ "$1" =~ ^[0-9]+(s|m|h|d)?$ ]]; }
 # в .timer-юнит → валидируем, чтобы непровалидированный ENV не дописал директив.
 _is_systime()  { [[ "$1" =~ ^[0-9]+(s|sec|m|min|h|hr|d|day)?$ ]]; }
 for _k in SYN_RATE SYN_BURST UDP_RATE UDP_BURST UDP_BULK_RATE UDP_BULK_BURST CONN_LIMIT ICMP_RATE ICMP_BURST \
-          SSH_RATE SSH_BURST PORTSCAN_RATE PORTSCAN_BURST SAFETY_DELAY \
+          SSH_RATE SSH_BURST PORTSCAN_RATE PORTSCAN_BURST PORTSCAN_LOG_RATE PORTSCAN_LOG_BURST SAFETY_DELAY \
           NA_CTG_PHANTOM_MIN NA_CTG_LIVE_FLOOR NA_CTG_COARSE_MULT; do
     _is_uint "${!_k}" || { err "$_k='${!_k}' — ожидается целое число"; exit 1; }
 done
@@ -326,24 +338,66 @@ if [[ "$FW_MODE" == "open" && "$ENABLE_PORTSCAN_BAN" == "1" ]]; then
 fi
 
 # whitelist → v4/v6
+# Whitelist в na — это НЕ «доверенный список», а ПОЛНЫЙ обход защиты: accept стоит выше
+# автобана, CrowdSec-бунсера и всех per-IP лимитов, а при whitelist-only даёт ещё и
+# допуск к контрол-порту node-агента. Отсюда два правила гигиены (issue #38):
+#   • дубликат из CSV оператора раньше уезжал как есть в nft-сет, в na_filter.nft и в
+#     CrowdSec-yaml (на боевых нодах один адрес был прописан дважды во всех трёх местах
+#     сразу) — дедупим, как это давно делает соседний add_npwl; /32 и /128 нормализуем к
+#     голому адресу: для nft это одно и то же значение, а как ТЕКСТ — два разных, и
+#     дедуп без нормализации их бы не поймал;
+#   • широкий CIDR принимался молча: /24 в конфиге ноды означает «256 чужих адресов
+#     имеют иммунитет», и такие строки живут годами — просто потому, что никто вслух
+#     не сказал, что это иммунитет, а не «список наших».
+# protect.conf при этом хранит WHITELIST РОВНО как задал оператор (это его intent),
+# поэтому дубликат там только предупреждается, а не переписывается за него.
 WL4=""; WL6=""
-add_wl() {
-    local x
+WL_DUP_SEEN=""
+# Дубль: предупреждаем ОДИН раз на значение (CSV с тройным повтором не должен
+# превращать вывод в простыню); из служебного источника (авто-IP сессии) — молча.
+wl_warn_dup() {   # wl_warn_dup <адрес> <источник>
+    [[ "$2" == "auto" ]] && return 0
+    [[ ",$WL_DUP_SEEN," == *",$1,"* ]] && return 0
+    WL_DUP_SEEN+="${WL_DUP_SEEN:+,}$1"
+    warn "WHITELIST: '$1' указан дважды — в правила пойдёт один раз; в protect.conf твой список остаётся как есть, почисти его сам"
+    return 0
+}
+# Широкий префикс: короче /29 (v4) или /64 (v6). 2^N — сколько адресов получают обход.
+wl_warn_wide() {   # wl_warn_wide <cidr> <разрядность> <порог>
+    local cidr="$1" width="$2" floor="$3" p n human=""
+    [[ "$cidr" == */* ]] || return 0
+    p="${cidr#*/}"
+    [[ "$p" =~ ^[0-9]+$ ]] || return 0
+    (( p < floor )) || return 0
+    n=$(( width - p ))
+    if (( n <= 31 )); then human=" ($(( 1 << n )))"; fi
+    warn "WHITELIST: $cidr — это ПОЛНЫЙ обход защиты (accept раньше автобана/CrowdSec/лимитов, допуск к node-port при whitelist-only) для 2^$n адресов$human; сузь до хостов"
+    return 0
+}
+add_wl() {   # add_wl <csv> [auto]  — 'auto' = служебный источник (IP текущей SSH-сессии)
+    local x src="${2:-}"
     for x in ${1//,/ }; do
         [[ -z "$x" ]] && continue
         if [[ "$x" == *:* ]]; then
             # строго hex+двоеточия (+опц. /prefix) — иначе значение уходит дословно в
             # nft-heredoc 'elements = { ... }' и может дописать произвольные правила
             [[ "$x" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]] || { err "WHITELIST: '$x' не валидный IPv6/CIDR"; return 1; }
+            [[ "$x" == */128 ]] && x="${x%/128}"
+            if [[ ",${WL6//, /,}," == *",$x,"* ]]; then wl_warn_dup "$x" "$src"; continue; fi
+            wl_warn_wide "$x" 128 64
             WL6+="${WL6:+, }$x"
-        elif [[ "$x" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then WL4+="${WL4:+, }$x"
+        elif [[ "$x" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+            [[ "$x" == */32 ]] && x="${x%/32}"
+            if [[ ",${WL4//, /,}," == *",$x,"* ]]; then wl_warn_dup "$x" "$src"; continue; fi
+            wl_warn_wide "$x" 32 29
+            WL4+="${WL4:+, }$x"
         else err "WHITELIST: '$x' не IPv4/IPv6/CIDR"; return 1; fi
     done
 }
 add_wl "$WHITELIST" || exit 1
 ADMIN_IP="$(ssh_client_ip || true)"
 if [[ -n "$ADMIN_IP" ]]; then
-    add_wl "$ADMIN_IP" || true
+    add_wl "$ADMIN_IP" auto || true
     info "Авто-whitelist твоего SSH-IP: $ADMIN_IP (защита от самоблокировки)"
 fi
 
@@ -712,7 +766,16 @@ fi
 # confirmed-бан. Снимает ложные баны целых CGNAT-операторов из-за одного шального скана.
 PORTSCAN=""
 if [[ "$ENABLE_PORTSCAN_BAN" == "1" && "$FW_MODE" != "open" ]]; then
-    _ps_log4="meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new limit rate 5/second log prefix \"[na portscan] \" level info"
+    # Единственное лог-правило тулкита, которое пишет в журнал в ШТАТНОМ режиме: оно
+    # стоит первым в анти-скан-блоке и матчит КАЖДЫЙ новый SYN, дошедший сюда (то есть
+    # любой стук в закрытый порт), а не превышение лимита. Поэтому именно его рейт вынесен
+    # в ручку и понижен до PORTSCAN_LOG_RATE/минуту (issue #35). Остальные лог-правила
+    # ([na synflood], [na ssh-flood], [na badflags]) оставлены на 5/second сознательно:
+    # они стоят ПОСЛЕ accept'ов с лимитом и срабатывают только сверх порога / на битых
+    # флагах, то есть в норме молчат и объёма в журнале не создают.
+    _ps_log4="# лог анти-скана выключен (PORTSCAN_LOG_RATE=0) — бан считают meter'ы ниже, не лог"
+    [[ "$PORTSCAN_LOG_RATE" != "0" ]] && \
+        _ps_log4="meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new limit rate ${PORTSCAN_LOG_RATE}/minute burst ${PORTSCAN_LOG_BURST} packets log prefix \"[na portscan] \" level info"
     if [[ "$ENABLE_BANONCE" == "1" ]]; then
         PORTSCAN="        # ANTI-SCAN (ban-once): 1-й быстрый скан → suspect, 2-й в окне ${SUSPECT_TIME} → бан.
         $_ps_log4
@@ -981,6 +1044,60 @@ if ! nft -c -f "$NFT_FILE"; then
 fi
 ok "nft -c: синтаксис валиден"
 
+# ─── Бюджет журнала под лог анти-скана (issue #35) ───────────────────────────
+# Тулкит одной рукой включает поток `[na portscan]`, другой (optimize) ограничивает
+# journald капом — и до v4.1 нигде не говорил, что вместе это даёт ретеншен меньше
+# суток. Считаем ДО применения (в DRY_RUN тоже) и говорим вслух.
+# ~500 Б — размер ЗАПИСИ journald, а не длины текста: сама строка «[na portscan] IN=…
+# SRC=… DPT=…» это ~120 Б, но journald хранит её с заголовком и двумя десятками полей
+# метаданных (_PID/_COMM/_BOOT_ID/_MACHINE_ID/…), а Compress=yes не сжимает записи
+# мельче 512 Б. Замер флота даёт верхнюю границу ~700 Б/запись (405 822 строки при
+# журнале 291.8 МБ) — берём 500 как срединную оценку.
+NA_JOURNAL_LINE_BYTES=500
+# Кап журнала в байтах. Порядок как у systemd: journald.conf, поверх — drop-in'ы
+# journald.conf.d/*.conf (побеждает последний), закомментированные строки не в счёт.
+# Не нашли — считаем 300M: столько ставит наш же optimize, и это худший реалистичный
+# случай (на ноде без optimize кап по умолчанию — 10% от размера /var/log).
+journald_cap_bytes() {
+    local f v last="" n u
+    for f in /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        v="$(awk -F= '/^[[:space:]]*SystemMaxUse[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2}' "$f" 2>/dev/null | tail -1)"
+        [[ -n "$v" ]] && last="$v"
+    done
+    [[ -n "$last" ]] || { echo $((300*1024*1024)); return 0; }
+    n="$(printf '%s' "$last" | grep -oE '^[0-9]+')" || true
+    [[ -n "$n" ]] || { echo $((300*1024*1024)); return 0; }
+    u="$(printf '%s' "${last#"$n"}" | tr '[:lower:]' '[:upper:]')"
+    case "$u" in
+        K) echo $((n*1024));;
+        M) echo $((n*1024*1024));;
+        G) echo $((n*1024*1024*1024));;
+        T) echo $((n*1024*1024*1024*1024));;
+        *) echo "$n";;   # без суффикса systemd читает как байты
+    esac
+}
+_hbytes() {   # байты → человекочитаемо (МБ/ГБ), без bc
+    local b="$1"
+    if   (( b >= 1024*1024*1024 )); then printf '%d.%02d ГБ' $((b/1024/1024/1024)) $(( (b*100/1024/1024/1024)%100 ))
+    elif (( b >= 1024*1024 ));      then printf '%d МБ' $((b/1024/1024))
+    else printf '%d КБ' $((b/1024)); fi
+}
+check_journal_budget() {
+    [[ "$ENABLE_PORTSCAN_BAN" == "1" && "$FW_MODE" != "open" ]] || return 0
+    (( PORTSCAN_LOG_RATE > 0 )) || return 0
+    local cap day pct
+    cap="$(journald_cap_bytes)"
+    (( cap > 0 )) || return 0
+    day=$(( PORTSCAN_LOG_RATE * 1440 * NA_JOURNAL_LINE_BYTES ))
+    pct=$(( day * 100 / cap ))
+    (( pct > 30 )) || return 0
+    warn "журнал: лог анти-скана при PORTSCAN_LOG_RATE=$PORTSCAN_LOG_RATE даёт ~$(_hbytes "$day")/сутки при капе journald $(_hbytes "$cap") (${pct}% в сутки) — история в журнале проживёт меньше $(( 100 / pct )) суток и вытеснит логи входов/сервисов"
+    warn "снизь PORTSCAN_LOG_RATE (0 = не логировать, на бан не влияет) или подними NA_JOURNAL_MAX_USE (optimize)"
+    return 0
+}
+check_journal_budget
+
 if [[ "$DRY_RUN" == "1" ]]; then
     ok "DRY-RUN: файл сгенерирован и проверен. Применение пропущено."
     info "Посмотреть: cat $NFT_FILE"
@@ -1051,8 +1168,12 @@ if [[ "$ENABLE_CROWDSEC" == "1" ]]; then
         # whitelist админа/панели в самом CrowdSec — чтобы IPS их не банил.
         # Ключи ip:/cidr: пишем ТОЛЬКО при наличии записей (пустые ключи валят парсер).
         mkdir -p /etc/crowdsec/parsers/s02-enrich
+        # Источник — УЖЕ разобранные WL4/WL6 (дедуп + нормализация /32,/128), а не сырой
+        # WHITELIST: иначе дубликат из CSV оператора попадал сюда третьим экземпляром,
+        # мимо чистки, сделанной для nft-сета и na_filter.nft (issue #38). ADMIN_IP тут
+        # отдельно не нужен — add_wl уже влил его в WL4/WL6.
         IP_ITEMS=""; CIDR_ITEMS=""
-        for x in ${WHITELIST//,/ } ${ADMIN_IP:-}; do
+        for x in ${WL4//,/ } ${WL6//,/ }; do
             [[ -z "$x" ]] && continue
             if [[ "$x" == */* ]]; then CIDR_ITEMS+="    - \"$x\""$'\n'; else IP_ITEMS+="    - \"$x\""$'\n'; fi
         done
@@ -1805,8 +1926,23 @@ EOF
 fi
 
 # ─── fw-status хелпер ────────────────────────────────────────────────────────
-cat > /usr/local/sbin/na-fw-status <<'STAT'
-#!/usr/bin/env bash
+# Все счётчики наборов идут через nft_set_count из lib/common.sh, а тело функций
+# ВШИВАЕТСЯ в хелпер через `declare -f`: na-fw-status — самостоятельный скрипт на ноде,
+# и lib/common.sh рядом с ним может не лежать вовсе (curl|bash гоняет модули из
+# временной папки, которой после установки уже нет).
+# Почему не `grep -c` по выводу nft: в заголовке ЛЮБОГО динамического набора всегда есть
+# строка `flags dynamic,timeout`, поэтому `grep -c timeout` рисовал «1» на ПУСТОМ наборе
+# и +1 на непустом, а элементы nft переносит по несколько в строку — «строка = адрес» не
+# выполняется в принципе. Один и тот же autoban считался в na-fw-status и в na-diagnose
+# двумя разными способами, и команды расходились между собой на живой ноде (issue #32/#36).
+write_fw_status() {
+    {
+        echo '#!/usr/bin/env bash'
+        echo '# na-fw-status — сводка защиты (ставит protect.sh, снимает rollback).'
+        echo '# Счётчики наборов — общий хелпер lib/common.sh, вшит сюда declare -f: скрипт'
+        echo '# должен работать на ноде сам по себе, без каталога с библиотекой рядом.'
+        declare -f nft_set_count nft_set_elems
+        cat <<'STAT'
 # Panic — первым и громко: это временный режим, который режет и легитимных
 # клиентов. Забытый включённым panic выглядит как «сервис тормозит без причины».
 if nft list table inet na_panic >/dev/null 2>&1; then
@@ -1819,26 +1955,29 @@ echo "── nft table inet na_filter ──"
 nft list table inet na_filter 2>/dev/null | grep -E 'policy|counter|elements' | head -40
 echo
 echo "── autoban (живые баны) ──"
-echo "v4: $(nft list set inet na_filter autoban_v4 2>/dev/null | grep -oE '[0-9.]+ timeout' | wc -l)   v6: $(nft list set inet na_filter autoban_v6 2>/dev/null | grep -c timeout)"
-nft list set inet na_filter autoban_v4 2>/dev/null | grep -oE '[0-9.]+ (timeout|expires)[^,]*' | head -15
+echo "v4: $(nft_set_count inet na_filter autoban_v4)   v6: $(nft_set_count inet na_filter autoban_v6)"
+# Кто именно забанен и до когда. Срез строго по блоку `elements = { … }`: вне его те же
+# слова timeout/expires живут в заголовке набора.
+nft list set inet na_filter autoban_v4 2>/dev/null | sed -n '/elements = {/,/^[[:space:]]*}/p' \
+  | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3} (timeout|expires)[^,}]*' | head -15
 if nft list set inet na_filter suspect_v4 >/dev/null 2>&1; then
-    echo "suspect (наблюдение, ban-once) v4: $(nft list set inet na_filter suspect_v4 2>/dev/null | grep -c timeout)   v6: $(nft list set inet na_filter suspect_v6 2>/dev/null | grep -c timeout)"
+    echo "suspect (наблюдение, ban-once) v4: $(nft_set_count inet na_filter suspect_v4)   v6: $(nft_set_count inet na_filter suspect_v6)"
 fi
 echo
 if nft list set inet na_filter blocklist_v4 >/dev/null 2>&1; then
     echo "── threat-блоклисты ──"
-    echo "v4: $(nft list set inet na_filter blocklist_v4 2>/dev/null | grep -coE '[0-9.]+')   v6: $(nft list set inet na_filter blocklist_v6 2>/dev/null | grep -c ':')   (обновляет na-blocklist-update)"
+    echo "v4: $(nft_set_count inet na_filter blocklist_v4)   v6: $(nft_set_count inet na_filter blocklist_v6)   (обновляет na-blocklist-update)"
     echo
 fi
 if nft list set inet na_filter na_fleet_v4 >/dev/null 2>&1; then
     echo "── fleet-sync (ноды флота → whitelist) ──"
-    echo "v4: $(nft list set inet na_filter na_fleet_v4 2>/dev/null | grep -coE '[0-9.]+')   v6: $(nft list set inet na_filter na_fleet_v6 2>/dev/null | grep -c ':')   (последний синк: $(journalctl -t na-fleet-sync -n1 --no-pager -o cat 2>/dev/null | head -c 80))"
+    echo "v4: $(nft_set_count inet na_filter na_fleet_v4)   v6: $(nft_set_count inet na_filter na_fleet_v6)   (последний синк: $(journalctl -t na-fleet-sync -n1 --no-pager -o cat 2>/dev/null | head -c 80))"
     echo
 fi
 if nft list table inet na_ctguard >/dev/null 2>&1; then
     echo "── ctguard (phantom-eviction) ──"
     enf="$(awk -F= '/^NA_CTG_ENFORCE/{print $2}' /etc/node-accelerator/ctguard.conf 2>/dev/null)"
-    echo "режим: $([ "${enf:-0}" = 1 ] && echo ENFORCE || echo observe)   фантомов в блоке v4: $(nft list set inet na_ctguard phantom_v4 2>/dev/null | grep -c timeout)   v6: $(nft list set inet na_ctguard phantom_v6 2>/dev/null | grep -c timeout)"
+    echo "режим: $([ "${enf:-0}" = 1 ] && echo ENFORCE || echo observe)   фантомов в блоке v4: $(nft_set_count inet na_ctguard phantom_v4)   v6: $(nft_set_count inet na_ctguard phantom_v6)"
     journalctl -t na-ctguard -n3 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
     echo
 fi
@@ -1853,7 +1992,10 @@ if command -v cscli >/dev/null 2>&1; then
     cscli metrics 2>/dev/null | sed -n '1,25p'
 fi
 STAT
-chmod +x /usr/local/sbin/na-fw-status
+    } > /usr/local/sbin/na-fw-status
+    chmod +x /usr/local/sbin/na-fw-status
+}
+write_fw_status
 
 # ─── top-talkers хелпер ──────────────────────────────────────────────────────
 # Если нода за реверс-прокси/балансировщиком/CDN — трафик идёт с горстки upstream-IP,
@@ -2147,7 +2289,7 @@ save_conf "$CONF_DIR/protect.conf" \
     FW_MODE SSH_PORT TCP_PORTS UDP_PORTS NODE_PORT WHITELIST \
     SYN_RATE SYN_BURST UDP_RATE UDP_BURST UDP_BULK_PORTS UDP_BULK_RATE UDP_BULK_BURST CONN_LIMIT \
     ICMP_RATE ICMP_BURST SSH_RATE SSH_BURST SSH_BAN_TIME \
-    PORTSCAN_BAN_TIME PORTSCAN_RATE PORTSCAN_BURST \
+    PORTSCAN_BAN_TIME PORTSCAN_RATE PORTSCAN_BURST PORTSCAN_LOG_RATE PORTSCAN_LOG_BURST \
     ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC CROWDSEC_STRICT ENABLE_SYNPROXY \
     ENABLE_BLOCKLISTS BLOCK_TOR BLOCKLIST_REFRESH ENABLE_BANONCE SUSPECT_TIME \
     ENABLE_SCANNERS SCANNER_REFRESH SCANNER_ASN_SOURCE SCANNER_ASN_MAX_PREFIXES \

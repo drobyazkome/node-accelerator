@@ -49,14 +49,28 @@ done
 [[ -z "$FOCUS_PORT" || "$FOCUS_PORT" =~ ^[0-9]+$ ]] || { err "--port должен быть числом"; exit 1; }
 
 NOW="$(date +%s)"
+# Глубина журнала в часах (возраст самой старой записи; -1 = не измерить). Без неё
+# оператор не отличает «атак не было» от «журнал уже вытеснен» — на публичной ноде
+# лог анти-скана съедал 300M меньше чем за сутки (issue #35/#41).
+journal_span_h() {
+    local first
+    command -v journalctl >/dev/null 2>&1 || { echo -1; return 0; }
+    first="$(journalctl -q --no-pager -o short-unix 2>/dev/null | head -n1 | awk '{print $1}' | cut -d. -f1)"
+    [[ "$first" =~ ^[0-9]+$ && "$NOW" -gt "$first" ]] || { echo -1; return 0; }
+    echo $(( (NOW - first) / 3600 ))
+}
+JSPAN="$(journal_span_h)"
 TMP="$(mktemp "${TMPDIR:-/tmp}/na-report.XXXXXX")"
 trap 'rm -f "$TMP" "$TMP".ab' EXIT
 
 # ─── 1. Парс журнала: nft log "[na <reason>]" → TSV  epoch \t reason \t src ──────
 # Только loggable-причины несут SRC= (autoban/blocklist дропают без лога — для них
 # есть счётчики/сеты). Окно --hours.
+# `-b all` обязателен: `-k` подразумевает `-b` (ТОЛЬКО текущая загрузка), и после ребута
+# отчёт «за 24ч» молча становился отчётом «с момента загрузки» — на ноде флота 2 298
+# событий против 72 485 реальных, ×31 (issue #41). Граница по времени (--since) остаётся.
 collect_events() {
-    journalctl -k --since "-${HOURS}h" --no-pager -o short-unix 2>/dev/null \
+    journalctl -k -b all --since "-${HOURS}h" --no-pager -o short-unix 2>/dev/null \
       | grep -aF '[na ' \
       | sed -nE 's/^([0-9]+)\.[0-9]+ .*\[na ([a-z-]+)\].*SRC=([0-9a-fA-F.:]+).*/\1\t\2\t\3/p' \
       > "$TMP" || true
@@ -209,7 +223,7 @@ emit_json() {
     )"
 
     printf '{'
-    printf '"na_version":"%s","window_hours":%s,"generated_at":%s,"events_total":%s,"ban_rate_5m":%s,' "${NA_VERSION:-?}" "$HOURS" "$NOW" "$total" "$rate"
+    printf '"na_version":"%s","window_hours":%s,"journal_span_h":%s,"generated_at":%s,"events_total":%s,"ban_rate_5m":%s,' "${NA_VERSION:-?}" "$HOURS" "$JSPAN" "$NOW" "$total" "$rate"
     printf '"drops_by_reason":{"portscan":%s,"synflood":%s,"ssh-flood":%s,"badflags":%s,"crowdsec":%s},' \
         "$portscan" "$synflood" "$sshflood" "$badflags" "$crowd"
     printf '"timeline":[%s],' "$tl"
@@ -266,6 +280,11 @@ B
     printf "%b" "$NC"
     local total rate; total="$(events_total)"; rate="$(ban_rate_5m)"
     info "Окно: последние ${HOURS}ч   ·   событий в drop-логе: $total   ·   за 5 мин: $rate"
+    if [[ "$JSPAN" -ge 0 && "$JSPAN" -lt "$HOURS" ]]; then
+        warn "журнал хранит только ~${JSPAN}ч (самая старая запись) — окно ${HOURS}ч фактически урезано; «событий мало» может значить «журнал вытеснен» (снизь PORTSCAN_LOG_RATE / подними NA_JOURNAL_MAX_USE)"
+    elif [[ "$JSPAN" -ge 0 ]]; then
+        info "глубина журнала: ~${JSPAN}ч (все загрузки, -b all)"
+    fi
 
     title "Дропы по причине"
     for r in portscan synflood ssh-flood badflags; do
@@ -283,6 +302,10 @@ B
         ips+=("$ip"); hitsarr+=("$h"); [[ "$h" -gt "$maxhits" ]] && maxhits="$h"
     done < <(top_ips_raw)
     enrich_asn "${ips[@]}"
+    # Колонка ASN остаётся «?», когда обогащать нечем: на боксе без dig И без whois
+    # отчёт молча выглядит иначе, чем у соседней ноды, и причина неочевидна.
+    command -v dig >/dev/null 2>&1 || command -v whois >/dev/null 2>&1 \
+        || info "ASN не обогащён: нет dig/whois (best-effort — колонка ASN останется '?')"
     printf "  %-18s %6s  %-22s %s\n" "IP" "hits" "ASN" "вердикт"
     for i in "${!ips[@]}"; do
         ip="${ips[$i]}"; h="${hitsarr[$i]}"
@@ -322,7 +345,7 @@ crowdsec_scenarios() {
 port_focus() {
     local p="$FOCUS_PORT" since="-${HOURS}h" lines n
     title "🔌 Порт $p — дроп-источники (за ${HOURS}ч)"
-    lines="$(journalctl -k --since "$since" --no-pager 2>/dev/null | grep -aF '[na ' | grep -aF "DPT=$p ")"
+    lines="$(journalctl -k -b all --since "$since" --no-pager 2>/dev/null | grep -aF '[na ' | grep -aF "DPT=$p ")"
     n="$(printf '%s\n' "$lines" | grep -c .)"
     info "drop-событий на DPT=$p: $n"
     if [[ "$n" -gt 0 ]]; then

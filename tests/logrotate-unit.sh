@@ -56,8 +56,10 @@ cat > "$T/wrap.sh" <<WRAP
 set -euo pipefail
 . "$REPO_ROOT/scripts/lib/common.sh"
 BACKUP="$T/backup"
+STATE_DIR="$T/state"
 . "$T/section.sh"
 WRAP
+STATE="$T/state"
 
 # ── Стабы ───────────────────────────────────────────────────────────────────────
 cat > "$T/bin/systemctl" <<'ST'
@@ -138,8 +140,24 @@ expect "секция отработала (rc=0)" run_section
 expect "станса создана (не снесена целиком)" test -f "$STANZA"
 expect_not "конфликтная маска nginx ОТДАНА чужой стансе" grep -qF "$T/var/log/nginx" "$STANZA"
 expect "неконфликтная маска remnanode осталась" grep -qF "$T/var/log/remnanode/*.log" "$STANZA"
-expect "warn про уступку маски напечатан" grep -q "уже покрыта чужой стансой" "$T/out.log"
+expect "warn про уступку маски напечатан" grep -q "отдана чужой стансе" "$T/out.log"
 expect "после переписывания стансы вердикт перепроверен" test "$(wc -l < "$REC/logrotate.argv")" -ge 2
+# issue #40: владелец найден, у него нет maxsize — об этом сказано САМИМ модулем, а не «проверь сам»
+expect "владелец уступленной маски назван (nginx-legacy)" grep -q "nginx-legacy" "$T/out.log"
+expect "у владельца daily БЕЗ maxsize — warn об этом" grep -q "daily БЕЗ maxsize/size" "$T/out.log"
+expect "состояние уступки записано (logrotate.ceded)" test -s "$STATE/logrotate.ceded"
+expect "в ceded: маска → владелец → none" grep -qE "^$T/var/log/nginx/\*\.log	$LRD/nginx-legacy	none$" "$STATE/logrotate.ceded"
+expect "в owned: оставшаяся маска remnanode" grep -qF "$T/var/log/remnanode/*.log" "$STATE/logrotate.owned"
+expect_not "в owned НЕТ уступленной маски nginx" grep -qF "$T/var/log/nginx" "$STATE/logrotate.owned"
+
+# ── Кейс 3b: у чужой стансы maxsize ЕСТЬ — уступка без тревоги о капе ───────────
+echo "== чужая станса с maxsize (кап есть) =="
+rm -f "$STANZA"
+printf '%s\n' "$T/var/log/nginx/*" '{' '    weekly' '    maxsize 500M' '}' > "$LRD/nginx-legacy"
+expect "секция отработала (rc=0)" run_section
+expect "уступка есть, кап найден — info, не warn" grep -q "кап на размер работает" "$T/out.log"
+expect_not "warn «БЕЗ maxsize» НЕ напечатан" grep -q "БЕЗ maxsize/size" "$T/out.log"
+expect "в ceded: capped" grep -qE "	capped$" "$STATE/logrotate.ceded"
 
 # ── Кейс 4: чужой дубликат вне наших масок ──────────────────────────────────────
 echo "== чужой дубликат (не наши маски) =="
@@ -150,15 +168,28 @@ expect "секция отработала (rc=0)" run_section
 expect "наши маски не тронуты" grep -qF "$T/var/log/nginx/*.log" "$STANZA"
 expect "warn про чужой конфликт напечатан" grep -q "вне наших масок" "$T/out.log"
 expect "цикл не зациклился (ровно один вызов -d)" test "$(wc -l < "$REC/logrotate.argv")" -eq 1
+expect_not "уступок нет — logrotate.ceded снят" test -e "$STATE/logrotate.ceded"
+expect "owned содержит обе маски" test "$(grep -c . "$STATE/logrotate.owned")" -eq 2
 
 # ── Кейс 5: все маски уже у чужих станс ─────────────────────────────────────────
 echo "== полная уступка всех масок =="
 rm -f "$STANZA"
 : > "$REC/foreign-dup.txt"
 printf '%s\n' "$T/var/log/nginx/access.log" "$T/var/log/remnanode/node.log" > "$REC/foreign-claims.txt"
+printf '%s\n' "$T/var/log/nginx/*" '{ daily }' > "$LRD/nginx-legacy"
+printf '%s\n' "$T/var/log/remnanode/*.log" '{ weekly }' > "$LRD/vpn-node-logs"
 expect "секция отработала (rc=0)" run_section
 expect "станса не создана (все пути чужие)" test ! -f "$STANZA"
-expect "инфо-сообщение напечатано" grep -q "свою не создаю" "$T/out.log"
+expect "полная уступка — это WARN, а не info (#40)" grep -q "\[!\].*свою НЕ создаю" "$T/out.log"
+expect "ceded перечисляет обе маски" test "$(grep -c . "$STATE/logrotate.ceded")" -eq 2
+expect "второй владелец (vpn-node-logs, weekly без maxsize) назван" grep -q "vpn-node-logs: там weekly БЕЗ maxsize" "$T/out.log"
+expect_not "owned снят (нашей стансы нет)" test -e "$STATE/logrotate.owned"
+
+# ── Кейс 6: ENABLE_LOGROTATE=0 — состояние прошлых прогонов не должно врать ────
+echo "== ENABLE_LOGROTATE=0 снимает состояние =="
+: > "$REC/logrotate.argv"
+ENABLE_LOGROTATE=0 NA_LOG_PATHS="$MASKS" "$WBASH" "$T/wrap.sh" > "$T/out.log" 2>&1 || true
+expect_not "ceded снят при ENABLE_LOGROTATE=0" test -e "$STATE/logrotate.ceded"
 
 if [ "$fail" -ne 0 ]; then echo "LOGROTATE-UNIT: FAIL"; exit 1; fi
-echo "LOGROTATE-UNIT: OK (ре-ран жив, конфликты решает вердикт logrotate, глобы не раскрываются, чужие дубликаты не наши)"
+echo "LOGROTATE-UNIT: OK (ре-ран жив, конфликты решает вердикт logrotate, глобы не раскрываются, чужие дубликаты не наши, уступка видна: владелец/кап/состояние)"

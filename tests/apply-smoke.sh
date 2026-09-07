@@ -27,6 +27,14 @@ sed -e "s#/etc/systemd/system/#$T/sys/#g" \
 for c in systemctl modprobe nft systemd-run sysctl conntrack; do
     printf '#!/bin/sh\nexit 0\n' > "$T/bin/$c"; chmod +x "$T/bin/$c"
 done
+# Стаб systemctl пишет журнал вызовов: protect включает СВОЙ na-firewall.service и не
+# трогает дистрибутивный nftables.service (его stop/restart/reload = flush ruleset).
+export NA_TEST_SYSTEMCTL_LOG="$T/systemctl.log"
+cat > "$T/bin/systemctl" <<'SYSTEMCTL'
+#!/bin/sh
+printf '%s\n' "$*" >> "$NA_TEST_SYSTEMCTL_LOG"
+exit 0
+SYSTEMCTL
 # curl падает → сетевые fetch (crowdsec/blocklist/fleet) деградируют мягко, не висят.
 printf '#!/bin/sh\nexit 1\n' > "$T/bin/curl"; chmod +x "$T/bin/curl"
 # docker падает → детект node-порта детерминированно идёт по .env/ss-веткам
@@ -71,6 +79,12 @@ rc=$?
 set -e
 
 fail=0
+grep -qx 'enable na-firewall.service' "$NA_TEST_SYSTEMCTL_LOG" \
+    || { echo "[x] protect не включил свой na-firewall.service"; fail=1; }
+if grep -Eq '^(enable|start|restart|reload|stop|disable|mask)( [^ ]+)* nftables(\.service)?( |$)' "$NA_TEST_SYSTEMCTL_LOG"; then
+    echo "[x] protect тронул чужой nftables.service (риск flush ruleset)"
+    fail=1
+fi
 if [ "$rc" -ne 0 ]; then echo "[x] apply упал (exit $rc)"; fail=1; fi
 if grep -qiE 'unbound variable|bad substitution' "$LOG"; then echo "[x] найдена unbound-переменная:"; grep -iE 'unbound variable|bad substitution' "$LOG"; fail=1; fi
 # ключевые блоки должны были отработать

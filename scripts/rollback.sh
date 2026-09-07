@@ -125,8 +125,9 @@ rollback_protect() {
           /usr/local/sbin/na-fleet-sync /usr/local/sbin/na-blocklist-update /usr/local/sbin/na-scanner-update /usr/local/sbin/na-ctguard \
           /usr/local/sbin/na-fw-safety-revert
     rm -f "$STATE_DIR/safety-fired.last" "$STATE_DIR/protect.lock" "$STATE_DIR/panic.on"
-    # nftables.service мы включали (boot-persist), но выключать не будем: он лишь грузит
-    # /etc/nftables.conf, который тулкит никогда не писал — трогать чужой конфиг нельзя.
+    # nftables.service до v4.1.2 включал сам protect (boot-persist), но выключать не будем: он
+    # лишь грузит /etc/nftables.conf, который тулкит никогда не писал — трогать чужой конфиг нельзя.
+    # panic.on — наш файл: режим паники живёт только в форке.
     systemctl is-enabled --quiet nftables 2>/dev/null && info "nftables.service оставлен включённым (грузит ваш /etc/nftables.conf, наших правил там нет)"
     rm -f /etc/modules-load.d/na-synproxy.conf "$STATE_DIR/.synproxy-degraded"
     # конфиги: persisted protect.conf, ctguard.conf, токен панели fleet.env (custom-blocklist.txt — данные оператора, оставляем)

@@ -619,8 +619,15 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now na-rps.service >/dev/null 2>&1 || true
-ok "RPS/RFS/XPS включены ($(nproc) ядер, NIC=${NIC:-автодетект на буте})"
+# Уже активный oneshot с RemainAfterExit=yes `enable --now` повторно НЕ запускает —
+# ре-ран переписывал хелпер, а rps_cpus оставался старым (после гонки с маршрутом на
+# буте — нулём), при этом печатался ok. Поэтому: enable + явный restart на каждом прогоне.
+systemctl enable na-rps.service >/dev/null 2>&1 || true
+if systemctl restart na-rps.service >/dev/null 2>&1; then
+    ok "RPS/RFS/XPS включены ($(nproc) ядер, NIC=${NIC:-автодетект на буте})"
+else
+    warn "na-rps.service: не удалось применить RPS — проверь journalctl -u na-rps.service"
+fi
 
 # ─── 6. NIC tuning ───────────────────────────────────────────────────────────
 title "NIC tuning (ring buffer, offloads)"

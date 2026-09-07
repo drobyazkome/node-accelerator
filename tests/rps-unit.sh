@@ -162,6 +162,53 @@ expect "NIC детектится ДО генерации юнита" \
     test "$(grep -n 'NIC="\$(default_iface || true)"' "$REPO_ROOT/scripts/optimize.sh" | cut -d: -f1)" \
        -lt "$(grep -n 'ExecStart=/usr/local/sbin/na-rps-setup' "$REPO_ROOT/scripts/optimize.sh" | cut -d: -f1)"
 
+# Активный oneshot `enable --now` повторно не исполняет. Гоняем саму секцию активации
+# optimize.sh в этом состоянии, а не хелпер напрямую.
+echo "== ре-ран при уже активном na-rps.service =="
+extract_activation() {
+    awk '
+        /^cat > \/etc\/systemd\/system\/na-rps.service <<EOF$/ { unit=1; next }
+        unit && /^EOF$/ { unit=0; activation=1; next }
+        activation && /^# .* NIC tuning/ { exit }
+        activation { print }
+    ' "$1" > "$2"
+}
+extract_activation "$REPO_ROOT/scripts/optimize.sh" "$T/activation.sh"
+cat > "$T/activation-driver.sh" <<'DRIVER'
+. "$REPO_ROOT/scripts/lib/common.sh"
+systemctl() {
+    case "$1" in
+        enable)
+            # oneshot с RemainAfterExit=yes уже активен: enable (с --now или без)
+            # ExecStart повторно не запускает.
+            return 0;;
+        restart)
+            [ "${RPS_FORCE_FAILURE:-0}" = 1 ] && return 1
+            "$WBASH" "$RPS" "$NIC";;
+        *) return 0;;
+    esac
+}
+. "$ACTIVATION"
+DRIVER
+run_activation() {
+    REPO_ROOT="$REPO_ROOT" WBASH="$WBASH" RPS="$RPS" NIC=ens18 \
+        ACTIVATION="$1" "$WBASH" "$T/activation-driver.sh" > "$T/activation.out" 2>&1
+}
+reset_net; mk_net ens18 1
+run_activation "$T/activation.sh"
+expect "ре-ран применяет RPS даже при активном старом oneshot" test "$(mask_of ens18)" = 7
+reset_net; mk_net ens18 1
+RPS_FORCE_FAILURE=1 run_activation "$T/activation.sh"
+expect "отказ применения — warn" grep -q 'не удалось применить RPS' "$T/activation.out"
+expect_not "при отказе нет рапорта об успехе" grep -q 'RPS/RFS/XPS включены' "$T/activation.out"
+if git -C "$REPO_ROOT" show v4.1.1:scripts/optimize.sh > "$T/v411-optimize.sh" 2>/dev/null; then
+    extract_activation "$T/v411-optimize.sh" "$T/v411-activation.sh"
+    reset_net; mk_net ens18 1
+    run_activation "$T/v411-activation.sh"
+    expect "регрессия v4.1.1: активный oneshot не применён (маска пуста)" test -z "$(mask_of ens18)"
+    expect "регрессия v4.1.1: при этом рапортовал успех" grep -q 'RPS/RFS/XPS включены' "$T/activation.out"
+fi
+
 # ── #28: ничего «курсорного» в не-терминал ──────────────────────────────────────
 echo "== курсорный вывод только в терминал (#28) =="
 expect_not "голых 'tput ' в коде optimize.sh не осталось" bare_tput "$REPO_ROOT/scripts/optimize.sh"

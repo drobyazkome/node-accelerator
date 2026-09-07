@@ -1136,7 +1136,12 @@ else
 fi
 systemctl daemon-reload
 systemctl enable na-firewall.service >/dev/null 2>&1 || true
-systemctl enable nftables >/dev/null 2>&1 || true
+# Дистрибутивный nftables.service НЕ включаем (до v4.1.2 включали «для персиста»):
+# его конфиг /etc/nftables.conf тулкит не пишет, а дефолтный шаблон начинается с
+# `flush ruleset` и ExecStop у юнита = `nft flush ruleset` — любой stop/restart/reload
+# такого «ничейного» юнита снёс бы na_filter, таблицы CrowdSec и Docker. Персист даёт
+# только na-firewall.service; состояние nftables.service — решение оператора, не трогаем
+# ни на первом прогоне, ни на ре-ране.
 ok "na-firewall.service включён (правила переживут reboot — если не сработает сейфти-таймер: он теперь снимает и автозагрузку)"
 
 fi  # ═══ конец блока файрвола (FW_MODE=skip его пропускает) ═══

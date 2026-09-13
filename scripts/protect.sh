@@ -1750,6 +1750,9 @@ Description=node-accelerator scanner blocklist refresh timer
 [Timer]
 OnBootSec=180s
 OnUnitActiveSec=$SCANNER_REFRESH
+# Календарный запуск как страховка: монотонный таймер с Persistent=true после
+# ребута может остаться без следующего срабатывания (NextElapse=infinity).
+OnCalendar=weekly
 RandomizedDelaySec=1800
 Persistent=true
 [Install]

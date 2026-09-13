@@ -1678,8 +1678,7 @@ fi
 n_feed=0
 if [ "$FEEDS" = "1" ]; then
     for u in \
-        "https://raw.githubusercontent.com/sancliffe/gcp-drop-mass-scanners/main/live_data/blacklist-scanners.txt" \
-        "https://raw.githubusercontent.com/cleverg0d/PublicGuard/main/scanners_list.txt" ; do
+        "https://raw.githubusercontent.com/sancliffe/gcp-drop-mass-scanners/main/live_data/blacklist-scanners.txt" ; do
         got="$(curl -fsSL --connect-timeout 10 --max-time 60 "$u" 2>/dev/null | grep -vE '^\s*#|^\s*$')" || continue
         [ -n "$got" ] || continue
         printf '%s\n' "$got" | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?$' >> "$TMP/v4.raw"

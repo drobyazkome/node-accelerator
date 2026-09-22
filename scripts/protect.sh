@@ -852,10 +852,38 @@ fi
 SCANNER_SETS=""; SCANNER_DROP=""
 if [[ "$ENABLE_SCANNERS" == "1" ]]; then
     SCANNER_SETS="    set scanner_v4 { type ipv4_addr; flags interval; auto-merge; }
-    set scanner_v6 { type ipv6_addr; flags interval; auto-merge; }"
+    set scanner_v6 { type ipv6_addr; flags interval; auto-merge; }
+    set tspu_v4 { type ipv4_addr; flags interval; auto-merge; }
+    set tspu_v6 { type ipv6_addr; flags interval; auto-merge; }"
+    # tspu_*: инфраструктура активного зондирования ТСПУ и госсети (фиды na-rkn-update,
+    # NA_SET=tspu na-scanner-update). Их НЕ дропаем на tcp 80/443: зонд цензора должен
+    # получить заглушку сайта, как любой клиент без ключа (REALITY/selfsteal), — тишина
+    # на 443 при живом сайте для всех остальных и есть отпечаток прокси. Остальные
+    # порты и не-TCP для них закрыты. (rw, 22.09.2026)
     SCANNER_DROP="        # масс-сканеры (ASN-лист + префикс-фиды) — обновляет na-scanner-update
         ip  saddr @scanner_v4 drop
-        ip6 saddr @scanner_v6 drop"
+        ip6 saddr @scanner_v6 drop
+        # ТСПУ/госсети — на 80/443 идут в заглушку (маскировка), остальное drop
+        ip  saddr @tspu_v4 meta l4proto != tcp drop
+        ip  saddr @tspu_v4 tcp dport != { 80, 443 } drop
+        ip6 saddr @tspu_v6 meta l4proto != tcp drop
+        ip6 saddr @tspu_v6 tcp dport != { 80, 443 } drop"
+fi
+
+# Исходящая гигиена (rw, 22.09.2026): узел не почтовик — SMTP наружу это спам с
+# выхода прокси и abuse-жалоба; приватные/CGNAT/тестовые адресаты через WAN —
+# страховка под `geoip:private → block` в роутинге Xray. Шлюз исключён явно
+# (у части хостеров он в 172.31/100.64), 169.254/16 не трогаем (metadata), 0/8 и
+# 240/4 тоже (DHCP). Только при известных WAN и шлюзе — иначе правил нет.
+OUTPUT_RULES=""
+GW="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')"
+if [[ -n "$WAN" && -n "$GW" ]]; then
+    _PRIV='10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 127.0.0.0/8, 192.0.2.0/24, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24'
+    OUTPUT_RULES="        # na-output-hygiene: узел не почтовик; приватные адресаты через WAN — только спуф/утечка
+        tcp dport { 25, 465, 587 } ct state new limit rate 1/minute burst 5 packets log prefix \"[na smtp-out] \" level info
+        tcp dport { 25, 465, 587 } ct state new counter drop
+        oifname \"${WAN}\" ip daddr != ${GW} ip daddr { ${_PRIV} } ct state new limit rate 1/minute burst 5 packets log prefix \"[na priv-out] \" level info
+        oifname \"${WAN}\" ip daddr != ${GW} ip daddr { ${_PRIV} } ct state new counter drop"
 fi
 
 # fleet-сеты (наполняет na-fleet-sync с панели Remnawave) + accept сразу после whitelist.
@@ -1033,7 +1061,10 @@ $PORTSCAN
     }
 
     chain forward { type filter hook forward priority filter; policy accept; }
-    chain output  { type filter hook output  priority filter; policy accept; }
+    chain output {
+        type filter hook output priority filter; policy accept;
+$OUTPUT_RULES
+    }
 }
 NFT
 
@@ -1560,7 +1591,17 @@ FEEDS="${SCANNER_FEEDS:-1}"
 RIPESTAT_TIMEOUT="${RIPESTAT_TIMEOUT:-15}"
 WHOIS_TIMEOUT="${WHOIS_TIMEOUT:-20}"
 
-nft list set inet na_filter scanner_v4 >/dev/null 2>&1 || { logger -t "$TAG" "сет scanner нет — выкл"; exit 0; }
+# NA_SET=tspu — тот же конвейер (три предохранителя, дырки под свои адреса,
+# last-known-good, кэш на ребут) для второго набора: инфраструктура ТСПУ/госсети
+# из custom-tspu.txt (пишет na-rkn-update). Без ASN и без сканер-фидов. Правило в
+# na_filter для tspu_* — drop всего, кроме tcp 80/443 (зонд цензора видит заглушку).
+SETN=scanner; CACHE=scanner-cache.nft
+if [ "${NA_SET:-scanner}" = tspu ]; then
+    SETN=tspu; TAG=na-tspu; CACHE=scanner-cache-tspu.nft
+    CUSTOM=/etc/node-accelerator/custom-tspu.txt; ASN_FILE=/dev/null; FEEDS=0
+fi
+
+nft list set inet na_filter "${SETN}_v4" >/dev/null 2>&1 || { logger -t "$TAG" "сет ${SETN} нет — выкл"; exit 0; }
 command -v curl >/dev/null 2>&1 || { logger -t "$TAG" "нет curl"; exit 1; }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 : > "$TMP/v4.raw"; : > "$TMP/v6.raw"
@@ -1714,21 +1755,21 @@ N4="$(grep -c . "$TMP/v4.clean" 2>/dev/null)"; N4="${N4:-0}"
 N6="$(grep -c . "$TMP/v6.clean" 2>/dev/null)"; N6="${N6:-0}"
 [ "$N4" -gt 0 ] || { logger -t "$TAG" "0 v4-записей (ASN=${n_asn}, фиды=${n_feed}) — last-known-good"; exit 0; }
 {
-    echo "flush set inet na_filter scanner_v4"
-    echo "add element inet na_filter scanner_v4 { $(paste -sd, "$TMP/v4.clean") }"
+    echo "flush set inet na_filter ${SETN}_v4"
+    echo "add element inet na_filter ${SETN}_v4 { $(paste -sd, "$TMP/v4.clean") }"
     if [ "$N6" -gt 0 ]; then
-        echo "flush set inet na_filter scanner_v6"
-        echo "add element inet na_filter scanner_v6 { $(paste -sd, "$TMP/v6.clean") }"
+        echo "flush set inet na_filter ${SETN}_v6"
+        echo "add element inet na_filter ${SETN}_v6 { $(paste -sd, "$TMP/v6.clean") }"
     fi
 } > "$TMP/sc.nft"
 if nft -f "$TMP/sc.nft" 2>/dev/null; then
-    mkdir -p /var/lib/node-accelerator && date +%s > /var/lib/node-accelerator/scanner.last
+    mkdir -p /var/lib/node-accelerator && date +%s > "/var/lib/node-accelerator/${SETN}.last"
     # Кэш применённого набора. Сеты nft живут только в памяти ядра: после ребута
     # scanner_* пустые, а таймер придёт лишь через свой интервал — на живой ноде
     # это оказалось ~12 минут полностью без блоклиста. na-scanner-restore.service
     # заливает этот файл сразу после na-firewall, ещё до появления сети наружу.
-    cp -f "$TMP/sc.nft" /var/lib/node-accelerator/scanner-cache.nft 2>/dev/null || true
-    logger -t "$TAG" "scanner обновлён: ${N4} v4 + ${N6} v6 (ASN=${n_asn}, ASN-пропущено=${n_skip}, фид-строк=${n_feed}, широких=${n_wide}, защищённых=${n_prot}, с-дыркой=${n_split})"
+    cp -f "$TMP/sc.nft" "/var/lib/node-accelerator/$CACHE" 2>/dev/null || true
+    logger -t "$TAG" "${SETN} обновлён: ${N4} v4 + ${N6} v6 (ASN=${n_asn}, ASN-пропущено=${n_skip}, фид-строк=${n_feed}, широких=${n_wide}, защищённых=${n_prot}, с-дыркой=${n_split})"
 else
     logger -t "$TAG" "nft apply не прошёл — last-known-good"
 fi
@@ -1742,6 +1783,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/na-scanner-update
+ExecStart=-/usr/bin/env NA_SET=tspu /usr/local/sbin/na-scanner-update
 EOF
     cat > /etc/systemd/system/na-scanner.timer <<EOF
 [Unit]
@@ -1772,6 +1814,7 @@ ConditionPathExists=/var/lib/node-accelerator/scanner-cache.nft
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /var/lib/node-accelerator/scanner-cache.nft
+ExecStart=-/usr/sbin/nft -f /var/lib/node-accelerator/scanner-cache-tspu.nft
 [Install]
 WantedBy=multi-user.target
 EOF

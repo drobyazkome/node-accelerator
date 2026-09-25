@@ -310,7 +310,9 @@ emit_json() {
             cend="$(openssl x509 -enddate -noout -in "$cf" 2>/dev/null | cut -d= -f2)"; [[ -n "$cend" ]] || continue
             cends="$(date -d "$cend" +%s 2>/dev/null)" || continue; [[ "$cends" =~ ^[0-9]+$ ]] || continue
             cd=$(( (cends - nowsec) / 86400 ))
-            { [[ "$certd" -lt 0 ]] || [[ "$cd" -lt "$certd" ]]; } && { certd="$cd"; certf="$cf"; }
+            # «ещё не нашли» — пустой certf, а не certd<0: просроченный серт тоже
+            # отрицателен, и до 25.09 следующий живой его заменял (ревью Codex)
+            { [[ -z "$certf" ]] || [[ "$cd" -lt "$certd" ]]; } && { certd="$cd"; certf="$cf"; }
         done
     fi
 
@@ -1155,9 +1157,11 @@ if command -v openssl >/dev/null 2>&1; then
         cend="$(openssl x509 -enddate -noout -in "$cf" 2>/dev/null | cut -d= -f2)"; [[ -n "$cend" ]] || continue
         cends="$(date -d "$cend" +%s 2>/dev/null)" || continue; [[ "$cends" =~ ^[0-9]+$ ]] || continue
         cdays=$(( (cends - $(date +%s)) / 86400 ))
-        { [[ "$CERT_MIN" -lt 0 ]] || [[ "$cdays" -lt "$CERT_MIN" ]]; } && { CERT_MIN="$cdays"; CERT_MIN_F="$cf"; }
+        { [[ -z "$CERT_MIN_F" ]] || [[ "$cdays" -lt "$CERT_MIN" ]]; } && { CERT_MIN="$cdays"; CERT_MIN_F="$cf"; }
     done
-    if [[ "$CERT_MIN" -lt 0 ]]; then
+    if [[ -n "$CERT_MIN_F" && "$CERT_MIN" -lt 0 ]]; then
+        bad  "TLS-серт ПРОСРОЧЕН на $(( -CERT_MIN )) дн ($CERT_MIN_F) — renewal сломан"
+    elif [[ -z "$CERT_MIN_F" ]]; then
         # «сертов нет» и «сенсор слеп» были неотличимы и оба тихие: на selfsteal-ноде с
         # сертом в /opt/<стек>/certs это молчание означало «о протухании не предупредим
         # вообще» — ровно то, ради чего сенсор и нужен (issue #39).

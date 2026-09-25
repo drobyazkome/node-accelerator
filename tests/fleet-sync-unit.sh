@@ -155,5 +155,67 @@ grep -qF '203.0.113.10' "$REC/nft.applied"; check $? "адреса v4 доеха
 nocontain "$REC/nft.applied" 'na_fleet_v6'; check $? "v6 не упомянут в транзакции"
 nocontain "$REC/logger.out" 'nft apply не прошёл'; check $? "нет ложного отказа в логе"
 
+# ── Отказы, найденные ревью Codex 25.09 ────────────────────────────────────────
+# Текстовый список: IP и имя хоста. curl отдаёт код из $REC/curl.rc, getent читает
+# $REC/dns.fixture («имя адрес»), при $REC/dns.down отказывает.
+printf '203.0.113.10\nrelay.example.net\n' > "$REC/fixture.txt"
+printf 'relay.example.net 203.0.113.77\n' > "$REC/dns.fixture"
+cat > "$T/bin/curl" <<'CURL5'
+#!/bin/sh
+OUT=""
+while [ $# -gt 0 ]; do case "$1" in -o) OUT="$2"; shift;; esac; shift; done
+[ -n "$OUT" ] && cp "$REC/fixture.txt" "$OUT"
+printf '200'
+exit "$(cat "$REC/curl.rc" 2>/dev/null || echo 0)"
+CURL5
+cat > "$T/bin/getent" <<'GETENT'
+#!/bin/sh
+[ -f "$REC/dns.down" ] && exit 2
+case "$1" in ahostsv4) ;; *) exit 2;; esac
+awk -v h="$2" '$1==h{print $2" STREAM "h; f=1} END{exit f?0:2}' "$REC/dns.fixture"
+GETENT
+cat > "$T/bin/nft" <<'NFT5'
+#!/bin/sh
+case "$1" in
+    list) exit 0;;
+    -f)   [ -f "$REC/nft.fail" ] && exit 1; cat "$2" >> "$REC/nft.applied"; exit 0;;
+esac
+exit 0
+NFT5
+chmod +x "$T/bin/curl" "$T/bin/getent" "$T/bin/nft"
+printf 'REMNAWAVE_NODES_URL=https://panel.example.com/fleet/nodes.txt\n' > "$T/conf/fleet.env"
+reset5() { rm -f "$REC"/logger.out "$REC"/nft.applied "$REC"/curl.rc "$REC"/dns.down "$REC"/nft.fail "$T/state/fleet-sync.last"; }
+
+echo "== оборванная передача: HTTP 200, curl 18 → last-known-good =="
+reset5; echo 18 > "$REC/curl.rc"
+bash "$T/na-fleet-sync"
+[ ! -f "$REC/nft.applied" ]; check $? "огрызок списка не применён"
+grep -qF 'curl=18' "$REC/logger.out"; check $? "в логе код curl, а не только HTTP"
+
+echo "== имя хоста разрешилось → в наборе и в кэше DNS =="
+reset5; rm -f "$T/state/fleet-dns.cache"
+bash "$T/na-fleet-sync"
+grep -qF '203.0.113.77' "$REC/nft.applied"; check $? "адрес relay.example.net в транзакции"
+grep -qF 'relay.example.net 203.0.113.77' "$T/state/fleet-dns.cache"; check $? "разрешение сохранено в кэш"
+[ -f "$T/state/fleet-sync.last" ]; check $? "полный список — штамп стоит"
+
+echo "== DNS отказал → адрес из кэша, узел не выпал =="
+reset5; touch "$REC/dns.down"
+bash "$T/na-fleet-sync"
+grep -qF '203.0.113.77' "$REC/nft.applied"; check $? "relay.example.net остался в whitelist по кэшу"
+grep -qF 'взято из кэша' "$REC/logger.out"; check $? "в логе — что взято из кэша"
+
+echo "== новое имя не разрешилось и кэша нет → без него, штамп не ставится =="
+reset5; touch "$REC/dns.down"; printf '203.0.113.10\nnew.example.net\n' > "$REC/fixture.txt"
+bash "$T/na-fleet-sync"
+grep -qF '203.0.113.10' "$REC/nft.applied"; check $? "остальной флот применён"
+[ ! -f "$T/state/fleet-sync.last" ]; check $? "неполный список — штамп успеха не ставится"
+grep -qF 'new.example.net' "$REC/logger.out"; check $? "неразрешённое имя названо в логе"
+
+echo "== nft -f отказал → код 1 =="
+reset5; touch "$REC/nft.fail"; printf '203.0.113.10\n' > "$REC/fixture.txt"
+rc=0; bash "$T/na-fleet-sync" || rc=$?
+[ "$rc" = 1 ]; check $? "отказ применения виден systemd (код 1, а не 0)"
+
 if [ "$fail" -ne 0 ]; then echo "FLEET-SYNC-UNIT: FAIL"; exit 1; fi
 echo "FLEET-SYNC-UNIT: OK (секреты не в argv, уходят через -H @file, URL в логе без userinfo, редиректы заблокированы, парсинг адресов и fail-safe работают)"

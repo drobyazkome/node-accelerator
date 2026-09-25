@@ -944,7 +944,11 @@ if [[ "$FW_MODE" == "open" ]]; then
 fi
 
 # ─── Генерация nft-файла ─────────────────────────────────────────────────────
-NFT_FILE="$CONF_DIR/na_filter.nft"
+# Новый ruleset пишется рядом, а не поверх рабочего: до 25.09 файл загрузки
+# заменялся ещё до `nft -c`, и отказ проверки или применения оставлял на диске
+# непроверенный ruleset — первый же ребут поднимал узел без фаервола (ревью Codex).
+NFT_LIVE="$CONF_DIR/na_filter.nft"
+NFT_FILE="$NFT_LIVE.new"
 [[ "$DRY_RUN" == "1" ]] && NFT_FILE="$(mktemp /tmp/na_filter.XXXXXX.nft)"
 mkdir -p "$CONF_DIR"
 title "Генерация nftables → $NFT_FILE"
@@ -1070,7 +1074,7 @@ NFT
 
 # ─── Проверка синтаксиса ДО применения ───────────────────────────────────────
 if ! nft -c -f "$NFT_FILE"; then
-    err "Сгенерированный ruleset не прошёл nft -c. Файл: $NFT_FILE (ничего не применено)."
+    err "Сгенерированный ruleset не прошёл nft -c. Файл: $NFT_FILE (ничего не применено, $NFT_LIVE не тронут)."
     exit 1
 fi
 ok "nft -c: синтаксис валиден"
@@ -1137,8 +1141,26 @@ fi
 
 # ─── Применяем (с сейфти-таймером) ───────────────────────────────────────────
 arm_safety
-nft -f "$NFT_FILE"
+if ! nft -f "$NFT_FILE"; then
+    # Без этой ветки `set -e` выходил со взведённым сейфти, и через SAFETY_DELAY тот
+    # удалял ПРЕЖНЮЮ рабочую таблицу и выключал автозагрузку (ревью Codex 25.09).
+    disarm_safety
+    err "nft -f не применил новый ruleset — прежние правила в ядре и $NFT_LIVE не тронуты, сейфти снят. Новый файл: $NFT_FILE"
+    exit 1
+fi
+# Применён — теперь он же грузится при старте; прежний остаётся рядом для ручного отката.
+[[ -f "$NFT_LIVE" ]] && cp -a "$NFT_LIVE" "$NFT_LIVE.prev" 2>/dev/null || true
+mv -f "$NFT_FILE" "$NFT_LIVE"
+NFT_FILE="$NFT_LIVE"
 ok "nftables na_filter применён"
+# Таблица пересоздана с пустыми динамическими наборами. Кэши последних удачных
+# обновлений (сканеры, ТСПУ, флот) заливаем сразу: до 25.09 повторный protect при
+# недоступных фидах оставлял наборы пустыми до следующего таймера (ревью Codex).
+for _c in scanner-cache.nft scanner-cache-tspu.nft fleet-cache.nft; do
+    [[ -f "$STATE_DIR/$_c" ]] || continue
+    if nft -f "$STATE_DIR/$_c" 2>/dev/null; then ok "набор из кэша: $_c"
+    else warn "кэш $_c не залит — набор наполнит таймер"; fi
+done
 # новый руллсет применён → прошлое срабатывание сейфти больше не актуально
 rm -f "$STATE_DIR/safety-fired.last" 2>/dev/null || true
 
@@ -1155,6 +1177,10 @@ RemainAfterExit=yes
 $SP_MODPROBE
 ExecStart=/usr/sbin/nft -f $NFT_FILE
 ExecReload=/usr/sbin/nft -f $NFT_FILE
+# reload пересоздаёт таблицу — наборы из кэшей, как после protect и при загрузке
+ExecReload=-/usr/sbin/nft -f /var/lib/node-accelerator/scanner-cache.nft
+ExecReload=-/usr/sbin/nft -f /var/lib/node-accelerator/scanner-cache-tspu.nft
+ExecReload=-/usr/sbin/nft -f /var/lib/node-accelerator/fleet-cache.nft
 
 [Install]
 WantedBy=multi-user.target
@@ -1345,16 +1371,19 @@ if [ -n "$NURL" ]; then
     CURL_HDR=()
     [ -s "$HDRF" ] && CURL_HDR=(-H @"$HDRF")
     HTTP="$(curl -fsS "${FS_REDIR[@]}" --proto-redir '=https' --max-time 15 -o "$TMP/r" -w '%{http_code}' \
-            "${CURL_HDR[@]}" "$NURL" 2>/dev/null || true)"
+            "${CURL_HDR[@]}" "$NURL" 2>/dev/null)"; CRC=$?
 else
     command -v jq >/dev/null 2>&1 || { logger -t "$TAG" "нет jq (нужен для /api/nodes)"; exit 1; }
     URL="${URL%/}"; SRC="$URL/api/nodes"
     printf 'Authorization: Bearer %s\n' "$TOKEN" >> "$HDRF"
     printf 'Accept: application/json\n' >> "$HDRF"
     HTTP="$(curl -fsS --max-time 15 -o "$TMP/r" -w '%{http_code}' \
-            -H @"$HDRF" "$SRC" 2>/dev/null || true)"
+            -H @"$HDRF" "$SRC" 2>/dev/null)"; CRC=$?
 fi
-[ "$HTTP" = "200" ] && [ -s "$TMP/r" ] || { logger -t "$TAG" "источник недоступен (HTTP=$HTTP) — last-known-good"; exit 0; }
+# Код curl отдельно от HTTP: оборванная передача печатает 200 и выходит с 18, и до
+# 25.09 первая строка текстового списка применялась как весь флот (ревью Codex).
+[ "${CRC:-1}" = 0 ] && [ "$HTTP" = "200" ] && [ -s "$TMP/r" ] \
+    || { logger -t "$TAG" "источник недоступен (HTTP=$HTTP, curl=${CRC:-?}) — last-known-good"; exit 0; }
 : > "$TMP/addr"
 if command -v jq >/dev/null 2>&1; then
     jq -r '.. | objects | .address? // empty' "$TMP/r" 2>/dev/null | awk 'NF' >> "$TMP/addr" || true
@@ -1368,14 +1397,30 @@ if [ ! -s "$TMP/addr" ] && [ -n "$NURL" ]; then
 fi
 sort -u -o "$TMP/addr" "$TMP/addr"
 [ -s "$TMP/addr" ] || { logger -t "$TAG" "в ответе нет адресов — last-known-good"; exit 0; }
-: > "$TMP/v4"; : > "$TMP/v6"
+# Имя, которое сейчас не разрешилось, берём из кэша прошлого удачного разрешения:
+# до 25.09 отказ DNS для одного узла молча выкидывал его из whitelist флота, и штамп
+# успеха ставился как за полный список (ревью Codex). Имя без кэша выпадает, но штамп
+# тогда не ставится — протухший синк виден в na-diagnose.
+DNSC=/var/lib/node-accelerator/fleet-dns.cache
+V4RE='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+: > "$TMP/v4"; : > "$TMP/v6"; : > "$TMP/dns.new"; unres=""; cached=""
 while IFS= read -r a; do
     [ -n "$a" ] || continue
-    if printf '%s' "$a" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then echo "$a" >> "$TMP/v4"; continue; fi
+    if printf '%s' "$a" | grep -qE "$V4RE"; then echo "$a" >> "$TMP/v4"; continue; fi
     if printf '%s' "$a" | grep -qE '^[0-9a-fA-F:]+$' && printf '%s' "$a" | grep -q ':'; then echo "$a" >> "$TMP/v6"; continue; fi
-    getent ahostsv4 "$a" 2>/dev/null | awk '{print $1}' >> "$TMP/v4"
-    getent ahostsv6 "$a" 2>/dev/null | awk '{print $1}' >> "$TMP/v6"
+    r4="$(getent ahostsv4 "$a" 2>/dev/null | awk '{print $1}' | grep -E "$V4RE" | sort -u)"
+    r6="$(getent ahostsv6 "$a" 2>/dev/null | awk '{print $1}' | grep -E '^[0-9a-fA-F:]+$' | grep ':' | sort -u)"
+    if [ -z "$r4$r6" ] && [ -r "$DNSC" ]; then
+        r4="$(awk -v h="$a" '$1==h && $2 !~ /:/ {print $2}' "$DNSC")"
+        r6="$(awk -v h="$a" '$1==h && $2 ~ /:/ {print $2}' "$DNSC")"
+        [ -n "$r4$r6" ] && cached="$cached $a"
+    fi
+    [ -n "$r4$r6" ] || { unres="$unres $a"; continue; }
+    for x in $r4; do echo "$x" >> "$TMP/v4"; echo "$a $x" >> "$TMP/dns.new"; done
+    for x in $r6; do echo "$x" >> "$TMP/v6"; echo "$a $x" >> "$TMP/dns.new"; done
 done < "$TMP/addr"
+[ -n "$cached" ] && logger -t "$TAG" "DNS не ответил, взято из кэша:$cached"
+[ -n "$unres" ] && logger -t "$TAG" "не разрешены и нет в кэше:$unres — без них, штамп не ставлю"
 V4="$(grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' "$TMP/v4" 2>/dev/null | sort -u | paste -sd, -)"
 V6="$(grep -E '^[0-9a-fA-F:]+$' "$TMP/v6" 2>/dev/null | grep ':' | sort -u | paste -sd, -)"
 [ -n "$V4" ] || [ -n "$V6" ] || { logger -t "$TAG" "0 валидных IP — last-known-good"; exit 0; }
@@ -1397,10 +1442,16 @@ nft list set inet na_filter na_fleet_v6 >/dev/null 2>&1 && HAVE_V6=1
 n4=$(printf '%s' "$V4" | tr ',' '\n' | grep -c . || true)
 n6=$(printf '%s' "$V6" | tr ',' '\n' | grep -c . || true)
 if nft -f "$TMP/upd.nft" 2>/dev/null; then
-    mkdir -p /var/lib/node-accelerator && date +%s > "$STAMP"
+    mkdir -p /var/lib/node-accelerator
+    [ -n "$unres" ] || date +%s > "$STAMP"
+    # кэш набора — для protect/reload/загрузки; кэш имён — для следующего отказа DNS
+    cp -f "$TMP/upd.nft" /var/lib/node-accelerator/fleet-cache.nft 2>/dev/null || true
+    [ -s "$TMP/dns.new" ] && cp -f "$TMP/dns.new" "$DNSC" 2>/dev/null
     logger -t "$TAG" "whitelist нод обновлён: ${n4} v4 + $([ "$HAVE_V6" = 1 ] && echo "${n6} v6" || echo "v6 сета нет") (из $(redact_url "$SRC"))"
 else
+    # код 1: systemd и обёртки видят отказ (до 25.09 выходило с 0 — ревью Codex)
     logger -t "$TAG" "nft apply не прошёл — last-known-good сохранён"
+    exit 1
 fi
 FSYNC
     chmod +x /usr/local/sbin/na-fleet-sync
@@ -1446,7 +1497,17 @@ CUSTOM=/etc/node-accelerator/custom-blocklist.txt
 nft list set inet na_filter blocklist_v4 >/dev/null 2>&1 || { logger -t "$TAG" "сет blocklist нет — выкл"; exit 0; }
 command -v curl >/dev/null 2>&1 || { logger -t "$TAG" "нет curl"; exit 1; }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-fetch() { curl -fsSL --connect-timeout 10 --max-time 60 "$1" 2>/dev/null; }
+# Ответ фида — только целиком: curl без -o и pipefail прятал обрыв (код 18) за
+# успешным grep, и огрызок фида заменял весь набор (ревью Codex 25.09). Отказ —
+# последний удачный ответ этого фида из кэша.
+FC=/var/lib/node-accelerator/feed-cache; mkdir -p "$FC" 2>/dev/null
+fetch() {
+    local k; k="$FC/$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+    if curl -fsSL --connect-timeout 10 --max-time 60 -o "$TMP/f" "$1" 2>/dev/null && [ -s "$TMP/f" ]; then
+        cp -f "$TMP/f" "$k" 2>/dev/null; cat "$TMP/f"
+    elif [ -s "$k" ]; then logger -t "$TAG" "$1 недоступен — взят прошлый ответ"; cat "$k"
+    else logger -t "$TAG" "$1 недоступен, кэша нет"; fi
+}
 : > "$TMP/v4.raw"; : > "$TMP/v6.raw"
 # Spamhaus DROP (json). jq может не быть — тогда фид пропускается.
 if command -v jq >/dev/null 2>&1; then
@@ -1483,6 +1544,7 @@ if nft -f "$TMP/bl.nft" 2>/dev/null; then
     logger -t "$TAG" "blocklist обновлён: ${N4} v4 + ${N6} v6"
 else
     logger -t "$TAG" "nft apply не прошёл — last-known-good"
+    exit 1
 fi
 BLUP
     chmod +x /usr/local/sbin/na-blocklist-update
@@ -1693,6 +1755,7 @@ _whois_v4() {
 }
 
 n_asn=0; n_skip=0
+AC=/var/lib/node-accelerator/asn-cache; mkdir -p "$AC" 2>/dev/null
 if [ -r "$ASN_FILE" ]; then
     while IFS= read -r line; do
         asn="${line%%#*}"; asn="$(printf '%s' "$asn" | tr -d '[:space:]')"
@@ -1701,7 +1764,15 @@ if [ -r "$ASN_FILE" ]; then
         pfx=""
         [ "$SRC" != "whois" ] && pfx="$(_ripestat_v4 "$asn")"
         if [ -z "$pfx" ] && [ "$SRC" != "ripestat" ]; then pfx="$(_whois_v4 "$asn")"; fi
-        [ -n "$pfx" ] || { logger -t "$TAG" "$asn: префиксы не получены — пропуск"; continue; }
+        # Отказ RIPE и whois — префиксы прошлого удачного резолва: до 25.09 ASN
+        # молча выпадал из набора на весь тик (ревью Codex).
+        if [ -n "$pfx" ]; then
+            printf '%s\n' "$pfx" > "$AC/$asn" 2>/dev/null
+        elif [ -s "$AC/$asn" ]; then
+            pfx="$(cat "$AC/$asn")"; logger -t "$TAG" "$asn: префиксы не получены — взяты из кэша"
+        else
+            logger -t "$TAG" "$asn: префиксы не получены, кэша нет — пропуск"; continue
+        fi
         cnt4="$(printf '%s\n' "$pfx" | grep -cE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+$' || true)"
         if [ "${cnt4:-0}" -gt "$ASN_MAX_PREFIXES" ]; then
             logger -t "$TAG" "$asn: ${cnt4} префиксов > лимита ${ASN_MAX_PREFIXES} — ПРОПУЩЕН целиком (вырос в хостинг? пересмотри $ASN_FILE)"
@@ -1720,7 +1791,17 @@ n_feed=0
 if [ "$FEEDS" = "1" ]; then
     for u in \
         "https://raw.githubusercontent.com/sancliffe/gcp-drop-mass-scanners/main/live_data/blacklist-scanners.txt" ; do
-        got="$(curl -fsSL --connect-timeout 10 --max-time 60 "$u" 2>/dev/null | grep -vE '^\s*#|^\s*$')" || continue
+        # Код curl отдельно от grep: обрыв (18) после первых строк раньше проходил
+        # как полный фид (ревью Codex 25.09). Отказ — прошлый удачный ответ.
+        k="$AC/feed-$(printf '%s' "$u" | cksum | cut -d' ' -f1)"
+        if curl -fsSL --connect-timeout 10 --max-time 60 -o "$TMP/feed" "$u" 2>/dev/null && [ -s "$TMP/feed" ]; then
+            cp -f "$TMP/feed" "$k" 2>/dev/null
+        elif [ -s "$k" ]; then
+            cp -f "$k" "$TMP/feed"; logger -t "$TAG" "фид $u недоступен — взят прошлый ответ"
+        else
+            logger -t "$TAG" "фид $u недоступен, кэша нет"; continue
+        fi
+        got="$(grep -vE '^\s*#|^\s*$' "$TMP/feed")"
         [ -n "$got" ] || continue
         printf '%s\n' "$got" | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?$' >> "$TMP/v4.raw"
         n_feed=$((n_feed + $(printf '%s\n' "$got" | grep -c . || echo 0)))
@@ -1772,6 +1853,7 @@ if nft -f "$TMP/sc.nft" 2>/dev/null; then
     logger -t "$TAG" "${SETN} обновлён: ${N4} v4 + ${N6} v6 (ASN=${n_asn}, ASN-пропущено=${n_skip}, фид-строк=${n_feed}, широких=${n_wide}, защищённых=${n_prot}, с-дыркой=${n_split})"
 else
     logger -t "$TAG" "nft apply не прошёл — last-known-good"
+    exit 1
 fi
 SCUP
     chmod +x /usr/local/sbin/na-scanner-update
@@ -1815,6 +1897,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /var/lib/node-accelerator/scanner-cache.nft
 ExecStart=-/usr/sbin/nft -f /var/lib/node-accelerator/scanner-cache-tspu.nft
+ExecStart=-/usr/sbin/nft -f /var/lib/node-accelerator/fleet-cache.nft
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -1888,20 +1971,29 @@ table inet na_ctguard {
 }
 NFTG
 
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# Снимки ss и адресов узла — с проверкой кода. До 25.09 упавший ss читался как «живых
+# соединений нет» (клиент — фантом), а упавший ip оставлял в исключениях только
+# loopback, и узел банил свой адрес; в enforce оба пути доходили до conntrack -D
+# (ревью Codex). Неполный снимок — тик без банов.
+ss -tnH state established > "$TMP/ss" 2>/dev/null || { logger -t "$TAG" "ss не отработал — тик без эвиктов"; exit 1; }
+ip -o addr show scope global > "$TMP/addr" 2>/dev/null && [ -s "$TMP/addr" ] \
+    || { logger -t "$TAG" "адреса узла не прочитаны (ip) — тик без эвиктов"; exit 1; }
+nft list set inet na_filter whitelist_v4 >/dev/null 2>&1 \
+    || { logger -t "$TAG" "whitelist na_filter не читается — тик без эвиктов"; exit 1; }
 CT_TOTAL="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)"
-SS_TOTAL="$(ss -tnH state established 2>/dev/null | wc -l)"
+SS_TOTAL="$(wc -l < "$TMP/ss")"
 # коарс-гейт: дорогой дамп только если conntrack заметно больше живых сокетов И велик
 [ "$CT_TOTAL" -ge "$PHANTOM_MIN" ] || exit 0
 [ "$CT_TOTAL" -ge $((SS_TOTAL * COARSE_MULT)) ] || exit 0
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # Живые established по src-IP клиента.
 # `::ffff:` снимаем обязательно: когда сервис слушает на `*:443` (v6-сокет принимает
 # v4-mapped), ss печатает пиров как `[::ffff:1.2.3.4]`, а conntrack — голым `1.2.3.4`.
 # Без нормализации лукап живых сокетов не матчится НИКОГДА, live всегда читается как 0,
 # и LIVE_FLOOR — вся CGNAT-защита — не срабатывает: эвиктится любой холдер выше
 # PHANTOM_MIN. Ровно та же нормализация давно стоит в harvest_node_port_peers().
-ss -tnH state established 2>/dev/null | awk '{print $NF}' \
+awk '{print $NF}' "$TMP/ss" \
   | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff:([0-9.]+)$/\1/' | sort | uniq -c > "$TMP/live"
 # Адреса, которые НЕ могут быть источником входящей атаки и потому не бывают кандидатами.
 # Первый src= в записи conntrack — клиентский IP только для ВХОДЯЩИХ соединений; для
@@ -1909,7 +2001,7 @@ ss -tnH state established 2>/dev/null | awk '{print $NF}' \
 # фильтра нода становится крупнейшим «фантом-холдером»: банит сама себя, и `conntrack -D`
 # по своему адресу сносит состояние всех проксируемых сессий разом. Приватные диапазоны
 # отсекаем по той же причине — там живут docker-бриджи и туннельные плечи.
-SELF_RE="$( { ip -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+SELF_RE="$( { awk '{print $4}' "$TMP/addr" | cut -d/ -f1
               printf '127.0.0.1\n::1\n'; } | sed 's/\./\\./g' | paste -sd'|' - )"
 PRIV_RE='^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|f[cd]|fe[89ab])'
 # conntrack по ПЕРВОМУ src= — только tcp, без собственных и служебных адресов
@@ -2071,8 +2163,9 @@ for p in ${PORTS//,/ }; do
 done
 [ -n "$filt" ] || { echo "нет портов для анализа"; exit 1; }
 echo "── Топ-$N удалённых IP по established TCP на портах: $PORTS ──"
+# с фильтром state у ss нет столбца State: пир — последнее поле, не $5 (ревью Codex 25.09)
 ss -Hnt state established "( $filt )" 2>/dev/null \
-    | awk '{print $5}' \
+    | awk '{print $NF}' \
     | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//; s/^::ffff:([0-9.]+)$/\1/' \
     | sort | uniq -c | sort -rn | head -n "$N"
 TT
@@ -2188,7 +2281,10 @@ panic_on() {
     [ -n "$rules" ] || die "в protect.conf нет портов, которые имеет смысл ужесточать"
 
     local e4 e6 wl4="" wl6=""
-    e4="$(wl_elements whitelist_v4)"; e6="$(wl_elements whitelist_v6)"
+    # Флот тоже: реле из na_fleet_* обходит лимиты na_filter, а panic (priority -3,
+    # раньше na_filter) до 25.09 резал его новые соединения (ревью Codex).
+    e4="$(printf '%s, %s' "$(wl_elements whitelist_v4)" "$(wl_elements na_fleet_v4)" | sed 's/^, //; s/, $//')"
+    e6="$(printf '%s, %s' "$(wl_elements whitelist_v6)" "$(wl_elements na_fleet_v6)" | sed 's/^, //; s/, $//')"
     [ -n "$e4" ] && wl4="elements = { $e4 }"
     [ -n "$e6" ] && wl6="elements = { $e6 }"
 

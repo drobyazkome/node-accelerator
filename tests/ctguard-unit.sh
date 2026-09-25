@@ -129,6 +129,23 @@ chk "клиент с живыми сокетами пощажён (live-lookup �
 chk "live у клиента с сокетами прочитан НЕ как 0 (ровно баг #22)" \
     "! grep -qE '${LEGIT}[^0-9].*live=0' <<<\"\$LOGTXT\""
 
+# ── Отказ датчиков → тик без эвиктов (ревью Codex 25.09) ───────────────────────
+# Упавший ss раньше читался как «живых сокетов нет» (клиент — фантом), упавший ip
+# оставлял в исключениях только loopback, и нода банила свой адрес.
+for broken in ss ip; do
+    echo "== ctguard: $broken упал =="
+    cp "$T/bin/$broken" "$T/$broken.ok"
+    printf '#!/bin/sh\nexit 1\n' > "$T/bin/$broken"; chmod +x "$T/bin/$broken"
+    rm -f "$REC/logger.txt" "$REC/conntrack.argv"
+    rc=0; bash "$T/na-ctguard" >/dev/null 2>&1 || rc=$?
+    LOGTXT="$(cat "$REC/logger.txt" 2>/dev/null || true)"
+    CTARGV="$(cat "$REC/conntrack.argv" 2>/dev/null || true)"
+    chk "$broken упал → код 1" "[ $rc -eq 1 ]"
+    chk "$broken упал → ни одного эвикта" "! grep -q 'evict ' <<<\"\$LOGTXT\""
+    chk "$broken упал → conntrack -D не вызывался" "! grep -q -- '-D' <<<\"\$CTARGV\""
+    cp "$T/$broken.ok" "$T/bin/$broken"
+done
+
 if [[ "$FAILED" -eq 0 ]]; then
     echo "CTGUARD-UNIT: OK (::ffff: нормализуется, свои и приватные адреса не кандидаты, фантом эвиктится)"
 else

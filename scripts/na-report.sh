@@ -380,6 +380,15 @@ pw_files()    { timeout 20 find /usr/local /opt /usr/bin /usr/sbin /root /home -
                   | grep -iE "$PROXYWARE_SIG" | head -20; }
 pw_docker()   { command -v docker >/dev/null 2>&1 || return 0
                 docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -iE "$PROXYWARE_SIG" | head -20; }
+# Какие источники реально отработали. Пустой вывод упавшей команды иначе читался как
+# «индикаторов нет», и вердикт был clean при слепых датчиках (ревью Codex 25.09).
+pw_unchecked() {
+    ps -eo pid= >/dev/null 2>&1 || echo processes
+    { command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files --type=service --no-legend >/dev/null 2>&1; } || echo services
+    ss -tnH >/dev/null 2>&1 || echo connections
+    [[ -d /usr/local && -r /usr/local ]] || echo files
+    return 0
+}
 # Коннекты к C2: резолвим домены → IP, ищем среди ESTABLISHED peer-адресов.
 pw_c2conn()   {
     local ips
@@ -449,7 +458,10 @@ B
     info "для VPN-ноды :443 и порт входа моста — норма; убедись, что незнакомых служб нет"
 
     hr
-    if [[ "$hit" -eq 0 ]]; then
+    local unchk; unchk="$(pw_unchecked | paste -sd, -)"
+    if [[ "$hit" -eq 0 && -n "$unchk" ]]; then
+        warn "ВЕРДИКТ: не проверено — источники не отработали: $unchk. «Чиста» сказать нельзя."
+    elif [[ "$hit" -eq 0 ]]; then
         ok "ВЕРДИКТ: признаков proxyware / residential-proxy НЕ найдено — нода чиста."
     else
         err "ВЕРДИКТ: есть индикаторы proxyware (см. ✘ выше) — разобраться вручную."
@@ -461,7 +473,10 @@ proxyware_json() {
     local proc svc cron files dock c2 lst verdict
     proc="$(pw_proc)";  svc="$(pw_services)"; cron="$(pw_cron)"
     files="$(pw_files)"; dock="$(pw_docker)"; c2="$(pw_c2conn)"; lst="$(pw_listeners)"
-    if [[ -n "$proc$svc$cron$files$dock$c2" ]]; then verdict="suspect"; else verdict="clean"; fi
+    local unchk; unchk="$(pw_unchecked)"
+    if [[ -n "$proc$svc$cron$files$dock$c2" ]]; then verdict="suspect"
+    elif [[ -n "$unchk" ]]; then verdict="incomplete"
+    else verdict="clean"; fi
     printf '{'
     printf '"na_version":"%s","verdict":"%s","generated_at":%s,' "${NA_VERSION:-?}" "$verdict" "$NOW"
     printf '"hits":{"processes":%s,"services":%s,"cron":%s,"files":%s,"docker":%s},' \

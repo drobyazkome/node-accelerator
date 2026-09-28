@@ -4,6 +4,9 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  # ручной прогон: форк не получил ни одного прогона на пуш в main (28.09),
+  # запуск из вкладки Actions или `gh workflow run ci` проверяет, что Actions живы
+  workflow_dispatch:
 
 # Токен раннера — только на чтение репозитория (ни один шаг не пишет в GitHub).
 permissions:

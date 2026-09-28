@@ -17,6 +17,8 @@
 #   6. fw_busy_check (28.09.2026): применение ждёт не только свой protect.lock — узел
 #      не правится, пока его держит fleet-fw-apply (оркестратор vpn) или взведена
 #      чужая страховка; под оркестратором (FWA_UNIT) его блокировка — не помеха.
+#   7. PORTSCAN_SKIP_PORTS (28.09.2026): правила бана анти-скана не считают клиентские
+#      порты, лог-правило считает все; без ручки — как в апстриме; мусор — отказ.
 #
 # Не требует root/сети/nft/systemd. Запуск: bash tests/protect-unit.sh
 # Проверить на старой версии:  NA_PROTECT_SH=<путь> bash tests/protect-unit.sh  (упадёт)
@@ -363,6 +365,52 @@ STUB
     check "проверка стоит перед взводом na-fw-safety, до nft -f" 1 \
           "$(grep -A1 '^fw_busy_check$' "$PROTECT" | grep -c '^arm_safety$')"
 fi
+
+# ─── 7. PORTSCAN_SKIP_PORTS: анти-скан не считает клиентские порты ───────────
+# Порог 15 новых SYN в минуту ловил активных XHTTP-клиентов на 443/8444 и банил их на
+# час вместе с UDP; флот чинил гвард после каждого ре-рана скриптом node-baseline (vpn),
+# и минуты между ре-раном и правкой клиенты были под баном (28.09.2026). Генерация —
+# DRY_RUN копии из раздела 5; `ip` — стаб (маршрута по умолчанию на стенде нет).
+echo "== 7. PORTSCAN_SKIP_PORTS: исключение клиентских портов в правилах гварда =="
+printf '#!/bin/sh\nexit 0\n' > "$A/bin/ip"; chmod +x "$A/bin/ip"
+gen() {   # gen [ПЕРЕМЕННАЯ=значение…] → путь сгенерированного na_filter или «нет файла» и вывод
+    local out f
+    out=$(env PATH="$A/bin:$PATH" REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=1 FW_MODE=strict ENABLE_CROWDSEC=0 "$@" \
+          "$WBASH" "$A/scripts/protect.sh" 2>&1) || true
+    f=$(printf '%s\n' "$out" | sed -n 's/.*Посмотреть: cat //p' | tail -1)
+    if [[ -n "$f" && -f "$f" ]]; then echo "$f"; else echo "нет файла"; printf '%s\n' "$out" | tail -3; fi
+}
+SKIP='tcp dport != { 443, 8444, 2222 }'
+f=$(gen PORTSCAN_SKIP_PORTS=443,8444,2222 | head -1)
+if [[ ! -f "$f" ]]; then
+    checkf "DRY_RUN с PORTSCAN_SKIP_PORTS не дал файла: $(gen PORTSCAN_SKIP_PORTS=443,8444,2222 | tail -2)"
+else
+    check "ban-once: исключение во всех четырёх правилах гварда (psc4, psc6, ps4, ps6)" 4 \
+          "$(grep -E '(meter |add @)(ps4|psc4|ps6|psc6) ' "$f" | grep -cF "ct state new $SKIP ")"
+    check "лог-правило анти-скана считает все порты — исключения в нём нет" 0 \
+          "$(grep -F '[na portscan]' "$f" | grep -c 'dport !=')"
+    rm -f "$f"
+fi
+f=$(gen | head -1)
+if [[ -f "$f" ]]; then
+    check "без ручки — как в апстриме: четыре правила гварда без исключения" "4 0" \
+          "$(grep -cE '(meter |add @)(ps4|psc4|ps6|psc6) ' "$f") $(grep -c 'dport != { 443' "$f")"
+    rm -f "$f"
+else
+    checkf "DRY_RUN без ручки не дал файла"
+fi
+f=$(gen PORTSCAN_SKIP_PORTS=443,8444,2222 ENABLE_BANONCE=0 | head -1)
+if [[ -f "$f" ]]; then
+    check "без ban-once: исключение в обоих правилах бана (ps4, ps6)" 2 \
+          "$(grep -E 'meter (ps4|ps6) ' "$f" | grep -cF "ct state new $SKIP ")"
+    rm -f "$f"
+else
+    checkf "DRY_RUN без ban-once не дал файла"
+fi
+out=$(gen 'PORTSCAN_SKIP_PORTS=443;rm -rf /')
+check "мусор в PORTSCAN_SKIP_PORTS — отказ до генерации" "нет файла 1" \
+      "$(printf '%s\n' "$out" | head -1) $(printf '%s\n' "$out" | grep -c 'ждал порты через запятую')"
+check "ручка сохраняется в protect.conf (save_conf)" 1 "$(grep -c ' PORTSCAN_SKIP_PORTS ' "$PROTECT")"
 
 echo
 echo "итого: ok=$PASS fail=$FAIL"

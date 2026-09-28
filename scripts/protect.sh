@@ -30,6 +30,9 @@
 #   PORTSCAN_LOG_RATE=60               строк [na portscan] в МИНУТУ в журнал (0 = не
 #   PORTSCAN_LOG_BURST=30              логировать вовсе; на бан не влияет — он по meter'ам)
 #   ENABLE_PORTSCAN_BAN=1  ENABLE_CROWDSEC=1  ENABLE_SYNPROXY=0
+#   PORTSCAN_SKIP_PORTS=""             порты через запятую, SYN на которые анти-скан не считает
+#                                      (клиентские: 443,8444, порт node-agent); пусто — считает
+#                                      все, как в апстриме
 #   CROWDSEC_STRICT=1                  ставить CrowdSec ТОЛЬКО из пиннингованного APT-репо;
 #                                      не поднялся — пропустить (0 = разрешить curl|bash)
 #   UDP_BULK_PORTS=""                  порты объёмного UDP-туннеля (Hysteria2/TUIC): свой,
@@ -108,6 +111,17 @@ PORTSCAN_RATE="${PORTSCAN_RATE:-15}"; PORTSCAN_BURST="${PORTSCAN_BURST:-30}"  # 
 # работает по meter'ам (add @suspect / add @autoban), а не по строкам лога.
 PORTSCAN_LOG_RATE="${PORTSCAN_LOG_RATE:-60}"; PORTSCAN_LOG_BURST="${PORTSCAN_LOG_BURST:-30}"
 ENABLE_PORTSCAN_BAN="${ENABLE_PORTSCAN_BAN:-1}"
+# Порты, SYN на которые анти-скан не считает (форк, 28.09.2026). Гвард — против перебора
+# портов, а порог PORTSCAN_RATE ловил и активных клиентов на своих же сервисных портах
+# (XHTTP с xmux — до 58 новых соединений с одного адреса): suspect, затем autoban на
+# PORTSCAN_BAN_TIME, а autoban режет весь трафик адреса, UDP тоже. Флот чинил гвард после
+# каждого ре-рана скриптом node-baseline (vpn), и в минуты между ре-раном и правкой
+# активные клиенты попадали под бан. Пусто — как в апстриме: считаются все порты.
+PORTSCAN_SKIP_PORTS="${PORTSCAN_SKIP_PORTS:-}"
+if [[ -n "$PORTSCAN_SKIP_PORTS" && ! "$PORTSCAN_SKIP_PORTS" =~ ^[0-9]{1,5}(,[0-9]{1,5})*$ ]]; then
+    err "PORTSCAN_SKIP_PORTS=«${PORTSCAN_SKIP_PORTS}» — ждал порты через запятую, например 443,8444,2222"
+    exit 1
+fi
 ENABLE_CROWDSEC="${ENABLE_CROWDSEC:-1}"
 # CROWDSEC_STRICT=1 (дефолт с v4.0) — никакого curl|bash-фоллбэка: не поднялся
 # пиннингованный репо, значит CrowdSec просто не ставим. Фоллбэк форсируется атакующим
@@ -808,20 +822,24 @@ if [[ "$ENABLE_PORTSCAN_BAN" == "1" && "$FW_MODE" != "open" ]]; then
     _ps_log4="# лог анти-скана выключен (PORTSCAN_LOG_RATE=0) — бан считают meter'ы ниже, не лог"
     [[ "$PORTSCAN_LOG_RATE" != "0" ]] && \
         _ps_log4="meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new limit rate ${PORTSCAN_LOG_RATE}/minute burst ${PORTSCAN_LOG_BURST} packets log prefix \"[na portscan] \" level info"
+    # PORTSCAN_SKIP_PORTS: SYN на клиентские порты правила бана не считают (лог-правило
+    # выше считает все — оно про стук в закрытые порты и режется своим рейтом)
+    _ps_skip=""
+    [[ -n "${PORTSCAN_SKIP_PORTS:-}" ]] && _ps_skip=" tcp dport != { ${PORTSCAN_SKIP_PORTS//,/, } }"
     if [[ "$ENABLE_BANONCE" == "1" ]]; then
         PORTSCAN="        # ANTI-SCAN (ban-once): 1-й быстрый скан → suspect, 2-й в окне ${SUSPECT_TIME} → бан.
         $_ps_log4
         # уже suspect и снова бьёт быстрее порога → confirmed-бан
-        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new ip saddr @suspect_v4 meter psc4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
-        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new ip6 saddr @suspect_v6 meter psc6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop
+        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new${_ps_skip} ip saddr @suspect_v4 meter psc4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
+        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new${_ps_skip} ip6 saddr @suspect_v6 meter psc6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop
         # ещё не suspect и бьёт быстрее порога → пометить suspect (без бана; скан дропнет catch-all)
-        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @suspect_v4 { ip saddr timeout ${SUSPECT_TIME} }
-        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @suspect_v6 { ip6 saddr timeout ${SUSPECT_TIME} }"
+        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new${_ps_skip} meter ps4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @suspect_v4 { ip saddr timeout ${SUSPECT_TIME} }
+        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new${_ps_skip} meter ps6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @suspect_v6 { ip6 saddr timeout ${SUSPECT_TIME} }"
     else
         PORTSCAN="        # ANTI-SCAN: бьёт по закрытым портам быстрее ${PORTSCAN_RATE}/min → бан ${PORTSCAN_BAN_TIME}.
         $_ps_log4
-        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
-        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop"
+        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new${_ps_skip} meter ps4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
+        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new${_ps_skip} meter ps6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop"
     fi
 fi
 
@@ -2468,7 +2486,7 @@ save_conf "$CONF_DIR/protect.conf" \
     FW_MODE SSH_PORT TCP_PORTS UDP_PORTS NODE_PORT WHITELIST \
     SYN_RATE SYN_BURST UDP_RATE UDP_BURST UDP_BULK_PORTS UDP_BULK_RATE UDP_BULK_BURST CONN_LIMIT \
     ICMP_RATE ICMP_BURST SSH_RATE SSH_BURST SSH_BAN_TIME \
-    PORTSCAN_BAN_TIME PORTSCAN_RATE PORTSCAN_BURST PORTSCAN_LOG_RATE PORTSCAN_LOG_BURST \
+    PORTSCAN_BAN_TIME PORTSCAN_RATE PORTSCAN_BURST PORTSCAN_LOG_RATE PORTSCAN_LOG_BURST PORTSCAN_SKIP_PORTS \
     ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC CROWDSEC_STRICT ENABLE_SYNPROXY \
     ENABLE_BLOCKLISTS BLOCK_TOR BLOCKLIST_REFRESH ENABLE_BANONCE SUSPECT_TIME \
     ENABLE_SCANNERS SCANNER_REFRESH SCANNER_ASN_SOURCE SCANNER_ASN_MAX_PREFIXES \

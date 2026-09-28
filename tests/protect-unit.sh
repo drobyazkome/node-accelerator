@@ -14,6 +14,9 @@
 #      защиты. Проверяем дедуп, нормализацию /32 и /128, предупреждение о широком CIDR.
 #   3. анти-скан-лог (issue #35): рейт лога вынесен в PORTSCAN_LOG_RATE (в МИНУТУ),
 #      0 = не логировать вовсе; плюс оценка суточного объёма против капа journald.
+#   6. fw_busy_check (28.09.2026): применение ждёт не только свой protect.lock — узел
+#      не правится, пока его держит fleet-fw-apply (оркестратор vpn) или взведена
+#      чужая страховка; под оркестратором (FWA_UNIT) его блокировка — не помеха.
 #
 # Не требует root/сети/nft/systemd. Запуск: bash tests/protect-unit.sh
 # Проверить на старой версии:  NA_PROTECT_SH=<путь> bash tests/protect-unit.sh  (упадёт)
@@ -264,7 +267,7 @@ STATE_DIR="$A/state"
 STUB
 DUPWL='198.51.100.4,203.0.113.7,198.51.100.4,203.0.113.7/32,203.0.113.0/24'
 set +e
-PATH="$A/bin:$PATH" WHITELIST="$DUPWL" ENABLE_CROWDSEC=1 \
+PATH="$A/bin:$PATH" WHITELIST="$DUPWL" ENABLE_CROWDSEC=1 NA_FWA_LOCK="$A/state/fleet-fw-apply.lock" \
     REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 "$WBASH" "$A/scripts/protect.sh" >"$A/apply.log" 2>&1
 rc=$?
 set -e
@@ -296,6 +299,70 @@ check "дубли названы поимённо (оба, включая нор
 check "широкий /24 предупреждён" 1 "$(grep -c 'ПОЛНЫЙ обход защиты' "$A/apply.log")"
 check "хелпер na-fw-status собран со вшитым счётчиком" 1 \
       "$(grep -c '^nft_set_count ' "$A/sbin/na-fw-status")"
+
+# ─── 6. Правка фаервола узла — одна за раз с оркестратором vpn ───────────────
+# fleet-fw-apply.sh (vpn) держит /run/lock/fleet-fw-apply.lock и взводит
+# fw-apply-safety-*, subnet-meter-rollout.sh — fw-safety, host-ssh-harden.sh —
+# ssh-harden-rollback. protect.sh мимо них получал их откат поверх себя, а его
+# na-fw-safety сносил их правку (vpn, остаток ревью Codex W, 28.09.2026). Под
+# оркестратором (FWA_UNIT) его блокировка и страховка не чужие.
+echo "== 6. fw_busy_check: блокировка fleet-fw-apply и чужие страховки =="
+awk '/^NA_FWA_LOCK=/{f=1} f{print} f&&/^\}$/{exit}' "$PROTECT" > "$T/fwbusy.sh"
+if ! grep -q '^fw_busy_check()' "$T/fwbusy.sh"; then
+    checkf "нет fw_busy_check в $PROTECT — фаервол правится мимо блокировки fleet-fw-apply и чужих страховок"
+else
+    F="$T/fwb"
+    mkdir -p "$F/bin" "$F/run"
+    # systemctl list-units … ШАБЛОН… — юниты из $FWB_UNITS, совпавшие с шаблоном
+    cat > "$F/bin/systemctl" <<'STUB'
+#!/usr/bin/env bash
+[[ "$1" == list-units ]] || exit 0
+shift; pats=""
+for a in "$@"; do [[ "$a" == --* ]] || pats="$pats $a"; done
+while IFS= read -r n; do
+    for p in $pats; do
+        # shellcheck disable=SC2053 # сравнение с шаблоном юнитов — намеренно
+        [[ $n == $p ]] && { echo "$n loaded active waiting stub"; break; }
+    done
+done < "$FWB_UNITS"
+STUB
+    # flock -n FD — настоящий flock(2) на унаследованном дескрипторе, как у util-linux
+    cat > "$F/bin/flock" <<'STUB'
+#!/usr/bin/perl
+use strict; use warnings; use Fcntl qw(:flock);
+my $nb = 0;
+while (@ARGV && $ARGV[0] =~ /^-/) { $nb = 1 if shift(@ARGV) eq '-n'; }
+open(my $fh, '>&=', shift @ARGV) or die "flock-стаб: $!\n";
+exit(flock($fh, LOCK_EX | ($nb ? LOCK_NB : 0)) ? 0 : 1);
+STUB
+    chmod +x "$F/bin/systemctl" "$F/bin/flock"
+    LOCKF="$F/run/fleet-fw-apply.lock"
+    fwb() {   # fwb "юнит…" [ПЕРЕМЕННАЯ=значение…] → «ok» или текст отказа
+        printf '%s\n' $1 > "$F/units"; shift
+        env PATH="$F/bin:$PATH" FWB_UNITS="$F/units" NA_FWA_LOCK="$LOCKF" "$@" \
+            "$WBASH" -c "set -euo pipefail; err(){ echo \"\$*\"; }; . '$T/fwbusy.sh'; fw_busy_check; echo ok" 2>&1 \
+            | tail -1 || true
+    }
+    hold()    { exec 7>"$LOCKF"; PATH="$F/bin:$PATH" flock -n 7; }
+    release() { exec 7>&-; }
+    FWA=fw-apply-safety-20260928-120000-a1b2c3
+    check "узел свободен — ok" ok "$(fwb '')"
+    check "своя na-fw-safety прошлого прогона не мешает (arm_safety перевзведёт)" ok "$(fwb 'na-fw-safety.timer')"
+    hold
+    check "блокировку держит fleet-fw-apply — отказ" 1 "$(fwb '' | grep -c 'узел занят: идёт fleet-fw-apply')"
+    check "под оркестратором (FWA_UNIT) его блокировка и страховка — не помеха" ok \
+          "$(fwb "$FWA.timer" FWA_UNIT="$FWA")"
+    check "NA_NO_LOCK=1 — без проверки" ok "$(fwb 'fw-safety.timer' NA_NO_LOCK=1)"
+    release
+    check "взведена fw-apply-safety-* без FWA_UNIT — отказ" 1 \
+          "$(fwb "$FWA.timer" | grep -c "чужая страховка: $FWA.timer —")"
+    check "под оркестратором fw-safety всё равно чужая — отказ с её именем" 1 \
+          "$(fwb "$FWA.timer fw-safety.timer" FWA_UNIT="$FWA" | grep -c 'чужая страховка: fw-safety.timer —')"
+    check "взведена ssh-harden-rollback — отказ" 1 \
+          "$(fwb 'ssh-harden-rollback.timer' | grep -c 'чужая страховка: ssh-harden-rollback.timer')"
+    check "проверка стоит перед взводом na-fw-safety, до nft -f" 1 \
+          "$(grep -A1 '^fw_busy_check$' "$PROTECT" | grep -c '^arm_safety$')"
+fi
 
 echo
 echo "итого: ok=$PASS fail=$FAIL"

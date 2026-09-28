@@ -512,7 +512,7 @@ arm_safety() {
     local pidf="$STATE_DIR/na-fw-safety.pid" logf="$STATE_DIR/na-fw-safety.log"
     [[ -f "$pidf" && ! -L "$pidf" ]] && { kill "$(cat "$pidf")" 2>/dev/null || true; }
     nohup sh -c 'sleep "$1"; /usr/local/sbin/na-fw-safety-revert 2>/dev/null; rm -f "$2"' \
-        _ "$SAFETY_DELAY" "$pidf" >"$logf" 2>&1 &
+        _ "$SAFETY_DELAY" "$pidf" >"$logf" 2>&1 8>&- &
     echo $! > "$pidf"
     ok "safety: nohup pid $(cat "$pidf")"
 }
@@ -521,6 +521,38 @@ disarm_safety() {
     local pidf="$STATE_DIR/na-fw-safety.pid"
     [[ -f "$pidf" && ! -L "$pidf" ]] && { kill "$(cat "$pidf")" 2>/dev/null || true; rm -f "$pidf"; }
     rm -f /tmp/na-fw-safety.pid /tmp/na-fw-safety.log 2>/dev/null || true   # legacy-стейт старых версий
+}
+
+# Правка фаервола узла — одна за раз, и не только среди прогонов protect. Оркестратор
+# vpn держит блокировку NA_FWA_LOCK (fleet-fw-apply.sh) и взводит свои страховки:
+# fw-apply-safety-<метка>, fw-safety (subnet-meter-rollout.sh), ssh-harden-rollback
+# (host-ssh-harden.sh). Прогон мимо них, пока их страховка взведена, получил бы поверх
+# себя их откат — ruleset до ИХ правки, — а na-fw-safety этого прогона, сработав, снёс
+# бы уже проверенную ими правку (vpn, остаток ревью Codex W, 28.09.2026). Под
+# fleet-fw-apply (его --cmd) оркестратор передаёт FWA_UNIT: узел и страховку держит он,
+# их не считаем чужими. Своя na-fw-safety прошлого прогона не мешает — arm_safety её
+# перевзводит. Блокировка держится до конца прогона (fd 8). NA_NO_LOCK=1 — без проверки.
+NA_FWA_LOCK="${NA_FWA_LOCK:-/run/lock/fleet-fw-apply.lock}"
+fw_busy_check() {
+    [[ "${NA_NO_LOCK:-0}" == "1" ]] && return 0
+    local busy="" u
+    if [[ -z "${FWA_UNIT:-}" ]] && command -v flock >/dev/null 2>&1; then
+        mkdir -p "$(dirname "$NA_FWA_LOCK")" 2>/dev/null || true
+        if ! { command exec 8>"$NA_FWA_LOCK"; } 2>/dev/null || ! flock -n 8; then
+            err "узел занят: идёт fleet-fw-apply или откат его страховки ($NA_FWA_LOCK) — дождаться"
+            exit 1
+        fi
+    fi
+    for u in $(systemctl list-units --state=active,activating --no-legend --plain \
+                   'fw-apply-safety-*.timer' 'fw-apply-safety-*.service' fw-safety.timer ssh-harden-rollback.timer \
+                   2>/dev/null | awk '{print $1}'); do
+        [[ -n "${FWA_UNIT:-}" && "$u" == "$FWA_UNIT".* ]] && continue
+        busy+=" $u"
+    done
+    if [[ -n "$busy" ]]; then
+        err "взведена чужая страховка:$busy — её откат ляжет поверх этого прогона; дождаться или снять после проверки входа"
+        exit 1
+    fi
 }
 
 # ─── FW_MODE=skip: nftables-файрвол не ставим ────────────────────────────────
@@ -1140,6 +1172,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
 fi
 
 # ─── Применяем (с сейфти-таймером) ───────────────────────────────────────────
+fw_busy_check
 arm_safety
 if ! nft -f "$NFT_FILE"; then
     # Без этой ветки `set -e` выходил со взведённым сейфти, и через SAFETY_DELAY тот

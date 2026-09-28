@@ -66,6 +66,8 @@ STATE_DIR="$T/state"
 STUB
 
 export PATH="$T/bin:$PATH"
+# блокировка фаервола узла (fw_busy_check) — в каталоге теста, не в /run/lock раннера
+export NA_FWA_LOCK="$T/state/fleet-fw-apply.lock"
 LOG="$T/apply.log"
 
 # Полный apply со ВСЕМИ v3.0-модулями включёнными (CrowdSec off — его пути хардкод).

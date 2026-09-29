@@ -11,7 +11,8 @@
 #   na-report.sh --top 20        — сколько top-IP/ASN показывать
 #   na-report.sh --ip 1.2.3.4    — глубокий вердикт по IP (rDNS, nft-сеты, conntrack, таймлайн)
 #   na-report.sh --port 443      — топ дроп-источников по порту + кто слушает
-#   na-report.sh --proxyware     — self-audit: следы proxyware/residential-proxy (для abuse-тикетов; + --json)
+#   na-report.sh --proxyware     — self-audit: следы proxyware/residential-proxy (для abuse-тикетов; + --json);
+#                                  код 0 — чисто, 1 — есть индикаторы, 2 — не все источники отработали
 #
 # JSON-схема:
 #   {window_hours, generated_at, events_total, ban_rate_5m,
@@ -20,7 +21,7 @@
 #    top_asn[{asn,name,country,pct}], top_ips[{ip,asn,country,hits,verdict}]}
 #
 # JSON-схема (--proxyware --json):
-#   {verdict:"clean|suspect", generated_at,
+#   {verdict:"clean|suspect|incomplete", generated_at, unchecked[],
 #    hits{processes[],services[],cron[],files[],docker[]},
 #    c2_connections[], external_listeners[]}
 
@@ -376,19 +377,34 @@ pw_cron()     { { crontab -l 2>/dev/null
                   while IFS=: read -r _u _; do crontab -l -u "$_u" 2>/dev/null; done < /etc/passwd
                   grep -rhsiE "$PROXYWARE_SIG" /etc/crontab /etc/cron.d /etc/cron.* /var/spool/cron 2>/dev/null
                 } | grep -iE "$PROXYWARE_SIG" | sort -u | head -20; }
-pw_files()    { timeout 20 find /usr/local /opt /usr/bin /usr/sbin /root /home -maxdepth 4 -xdev -type f 2>/dev/null \
-                  | grep -iE "$PROXYWARE_SIG" | head -20; }
+# Сборщик с отказом пишет своё имя в $PW_FAILF: вызывается он в $(…), и переменная
+# родителю не видна. До 29.09 доступность проверялась отдельной пробой — find, упавший
+# по timeout без единого файла, давал clean при читаемом /usr/local (ревью Codex N2).
+PW_FAILF=/dev/null
+pw_fail()     { echo "$1" >> "$PW_FAILF"; }
+pw_files()    { local d dirs=() out rc
+                for d in /usr/local /opt /usr/bin /usr/sbin /root /home; do [[ -d "$d" ]] && dirs+=("$d"); done
+                (( ${#dirs[@]} )) || { pw_fail files; return 0; }   # find без путей искал бы в "."
+                out="$(timeout 20 find "${dirs[@]}" -maxdepth 4 -xdev -type f 2>/dev/null)"; rc=$?
+                [[ "$rc" == 0 ]] || pw_fail files     # 124 — не успел за 20 с, 1 — часть не прочитана
+                printf '%s\n' "$out" | grep -iE "$PROXYWARE_SIG" | head -20; }
 pw_docker()   { command -v docker >/dev/null 2>&1 || return 0
-                docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -iE "$PROXYWARE_SIG" | head -20; }
-# Какие источники реально отработали. Пустой вывод упавшей команды иначе читался как
-# «индикаторов нет», и вердикт был clean при слепых датчиках (ревью Codex 25.09).
+                local out
+                out="$(docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null)" || { pw_fail docker; return 0; }
+                printf '%s\n' "$out" | grep -iE "$PROXYWARE_SIG" | head -20; }
+# Какие источники не отработали: пробы процессов, юнитов и соединений плюс отказы
+# самих сборщиков. Пустой вывод упавшей команды иначе читался как «индикаторов нет»,
+# и вердикт был clean при слепых датчиках (ревью Codex 25.09).
 pw_unchecked() {
     ps -eo pid= >/dev/null 2>&1 || echo processes
     { command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files --type=service --no-legend >/dev/null 2>&1; } || echo services
     ss -tnH >/dev/null 2>&1 || echo connections
-    [[ -d /usr/local && -r /usr/local ]] || echo files
+    [[ -s "$PW_FAILF" ]] && sort -u "$PW_FAILF"
+    [[ "${PW_NOSTATE:-0}" == 1 ]] && echo "учёт-отказов"   # без файла отказы сборщиков не видны
     return 0
 }
+pw_begin()    { PW_FAILF="$(mktemp "${TMPDIR:-/tmp}/na-pw.XXXXXX" 2>/dev/null)" || { PW_FAILF=/dev/null; PW_NOSTATE=1; }; }
+pw_end()      { [[ "$PW_FAILF" != /dev/null ]] && rm -f "$PW_FAILF"; PW_FAILF=/dev/null; }
 # Коннекты к C2: резолвим домены → IP, ищем среди ESTABLISHED peer-адресов.
 pw_c2conn()   {
     local ips
@@ -436,7 +452,8 @@ B
     printf "%b" "$NC"
     info "Read-only проверка на residential-proxy / bandwidth-SDK (для abuse-тикетов)."
 
-    local hit=0
+    local hit=0 rc=0
+    pw_begin
     title "Сигнатуры известного proxyware"
     pw_section "процессы"      "$(pw_proc)"     || hit=1
     pw_section "systemd-юниты" "$(pw_services)" || hit=1
@@ -460,25 +477,30 @@ B
     hr
     local unchk; unchk="$(pw_unchecked | paste -sd, -)"
     if [[ "$hit" -eq 0 && -n "$unchk" ]]; then
-        warn "ВЕРДИКТ: не проверено — источники не отработали: $unchk. «Чиста» сказать нельзя."
+        warn "ВЕРДИКТ: не проверено — источники не отработали: $unchk. «Чиста» сказать нельзя."; rc=2
     elif [[ "$hit" -eq 0 ]]; then
         ok "ВЕРДИКТ: признаков proxyware / residential-proxy НЕ найдено — нода чиста."
     else
-        err "ВЕРДИКТ: есть индикаторы proxyware (см. ✘ выше) — разобраться вручную."
+        err "ВЕРДИКТ: есть индикаторы proxyware (см. ✘ выше) — разобраться вручную."; rc=1
     fi
     hr
+    pw_end
+    return "$rc"
 }
 
 proxyware_json() {
-    local proc svc cron files dock c2 lst verdict
+    local proc svc cron files dock c2 lst verdict rc=0
+    pw_begin
     proc="$(pw_proc)";  svc="$(pw_services)"; cron="$(pw_cron)"
     files="$(pw_files)"; dock="$(pw_docker)"; c2="$(pw_c2conn)"; lst="$(pw_listeners)"
     local unchk; unchk="$(pw_unchecked)"
-    if [[ -n "$proc$svc$cron$files$dock$c2" ]]; then verdict="suspect"
-    elif [[ -n "$unchk" ]]; then verdict="incomplete"
+    pw_end
+    if [[ -n "$proc$svc$cron$files$dock$c2" ]]; then verdict="suspect"; rc=1
+    elif [[ -n "$unchk" ]]; then verdict="incomplete"; rc=2
     else verdict="clean"; fi
     printf '{'
     printf '"na_version":"%s","verdict":"%s","generated_at":%s,' "${NA_VERSION:-?}" "$verdict" "$NOW"
+    printf '"unchecked":%s,' "$(printf '%s\n' "$unchk" | _json_arr)"
     printf '"hits":{"processes":%s,"services":%s,"cron":%s,"files":%s,"docker":%s},' \
         "$(printf '%s\n' "$proc"  | _json_arr)" \
         "$(printf '%s\n' "$svc"   | _json_arr)" \
@@ -488,12 +510,16 @@ proxyware_json() {
     printf '"c2_connections":%s,"external_listeners":%s}\n' \
         "$(printf '%s\n' "$c2"  | _json_arr)" \
         "$(printf '%s\n' "$lst" | _json_arr)"
+    return "$rc"
 }
 
 # ─── Диспетч ────────────────────────────────────────────────────────────────────
+# --proxyware: код = вердикт (0 чисто, 1 индикаторы, 2 не всё проверено) — до 29.09
+# неполный отчёт выходил с 0, и обёртки принимали его за чистый (ревью Codex N2)
 if [[ "$PROXYAUDIT" == "1" ]]; then
-    if [[ "$JSON" == "1" ]]; then proxyware_json; else proxyware_audit; fi
-    exit 0
+    _rc=0
+    if [[ "$JSON" == "1" ]]; then proxyware_json || _rc=$?; else proxyware_audit || _rc=$?; fi
+    exit "$_rc"
 fi
 if [[ "$JSON" == "1" ]]; then emit_json; exit 0; fi
 [[ -n "$FOCUS_PORT" ]] && { port_focus; exit 0; }

@@ -146,6 +146,34 @@ for broken in ss ip; do
     cp "$T/$broken.ok" "$T/bin/$broken"
 done
 
+# ── FW_MODE=skip: таблицы na_filter нет — whitelist из conf в своей таблице ─────
+# (ревью Codex N2, 29.09): обязательная сверка с whitelist na_filter кончала каждый
+# тик отказом, хотя установка рапортовала о работающем ctguard.
+echo "== ctguard: FW_MODE=skip — whitelist из conf, na_filter не нужен =="
+cp "$T/bin/nft" "$T/nft.ok"; cp "$T/conf/ctguard.conf" "$T/ctguard.conf.ok"
+cat > "$T/bin/nft" <<NFT2
+#!/bin/sh
+printf '%s\n' "\$*" >> "$REC/nft.argv"
+case "\$*" in
+  *"list set inet na_filter"*) exit 1 ;;
+  "-f "*) cat "\$2" >> "$REC/white.nft"; exit 0 ;;
+  *"get element inet na_ctguard white_v4 { $PHANTOM }"*) exit 0 ;;
+  *"get element"*) exit 1 ;;
+  *"list table"*)  exit 0 ;;
+esac
+exit 0
+NFT2
+chmod +x "$T/bin/nft"
+printf 'NA_CTG_WL_SRC=conf\nNA_CTG_WHITELIST="%s,2001:db8::/32"\n' "$PHANTOM" >> "$T/conf/ctguard.conf"
+rm -f "$REC/logger.txt" "$REC/conntrack.argv" "$REC/white.nft"
+rc=0; bash "$T/na-ctguard" >/dev/null 2>&1 || rc=$?
+LOGTXT="$(cat "$REC/logger.txt" 2>/dev/null || true)"
+chk "без na_filter тик доходит до конца (код 0)" "[ $rc -eq 0 ]"
+chk "whitelist из conf залит в na_ctguard (v4)" "grep -qF 'add element inet na_ctguard white_v4 { $PHANTOM }' '$REC/white.nft'"
+chk "…и v6 — в white_v6" "grep -qF 'add element inet na_ctguard white_v6 { 2001:db8::/32 }' '$REC/white.nft'"
+chk "адрес из whitelist conf не эвиктится" "! grep -q 'evict $PHANTOM' <<<\"\$LOGTXT\""
+cp "$T/nft.ok" "$T/bin/nft"; cp "$T/ctguard.conf.ok" "$T/conf/ctguard.conf"
+
 if [[ "$FAILED" -eq 0 ]]; then
     echo "CTGUARD-UNIT: OK (::ffff: нормализуется, свои и приватные адреса не кандидаты, фантом эвиктится)"
 else

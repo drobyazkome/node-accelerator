@@ -492,6 +492,25 @@ env "$SSHENV" TERM=dumb "$WBASH" "$DIAG" > "$T/out7c.txt" 2>/dev/null || true
 grep_ok  "текст: станса на месте → ✔ с перечнем масок" "часовой таймер активен, станса на месте (/var/log/remnanode/*.log)" "$T/out7c.txt"
 rm -f "$LRSTATE/logrotate.owned"
 
+echo "== na-report --proxyware: оборванный сбор файлов — не «чисто» (ревью Codex N2, 29.09) =="
+# До 29.09 доступность проверялась отдельной пробой (читаем ли /usr/local), и find,
+# убитый timeout без единого файла, давал clean с кодом 0. Здесь timeout — стаб: find
+# не запускается, код — из PW_TO_RC; ss и systemctl отвечают пусто и успешно.
+PW="$T/pw"; mkdir -p "$PW/bin"
+printf '#!/bin/sh\nexit "${PW_TO_RC:-0}"\n' > "$PW/bin/timeout"
+printf '#!/bin/sh\nexit 0\n' > "$PW/bin/ss"; printf '#!/bin/sh\nexit 0\n' > "$PW/bin/systemctl"
+chmod +x "$PW/bin/"*
+pw() {   # pw КОД_TIMEOUT → «код вердикт» и JSON в $PW/out.json
+    local rc=0
+    env PATH="$PW/bin:$PATH" PW_TO_RC="$1" TERM=dumb "$WBASH" "$REPO_ROOT/scripts/na-report.sh" --proxyware --json \
+        > "$PW/out.json" 2>/dev/null || rc=$?
+    printf '%s %s' "$rc" "$(grep -oE '"verdict":"[a-z]+"' "$PW/out.json" | cut -d'"' -f4)"
+}
+check "find уложился — clean, код 0"                  "0 clean"      "$(pw 0)"
+check "find убит timeout (124) — incomplete, код 2"   "2 incomplete" "$(pw 124)"
+check "в JSON названо, что не проверено"              1 "$(grep -c '"unchecked":\["files"\]' "$PW/out.json")"
+check "JSON — одна строка"                            1 "$(wc -l < "$PW/out.json" | tr -d ' ')"
+
 echo
 echo "  прогон: $PASS ok, $FAIL fail"
 if [[ "$FAIL" -ne 0 ]]; then echo "DIAGNOSE-UNIT: FAIL"; exit 1; fi

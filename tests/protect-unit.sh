@@ -319,6 +319,7 @@ else
     cat > "$F/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
 [[ "$1" == list-units ]] || exit 0
+[[ -n "${FWB_SYSTEMCTL_FAIL:-}" ]] && exit 1      # D-Bus недоступен: ни строки, код 1
 shift; pats=""
 for a in "$@"; do [[ "$a" == --* ]] || pats="$pats $a"; done
 while IFS= read -r n; do
@@ -327,6 +328,7 @@ while IFS= read -r n; do
         [[ $n == $p ]] && { echo "$n loaded active waiting stub"; break; }
     done
 done < "$FWB_UNITS"
+exit 0    # как настоящий systemctl: ничего не совпало — пустой вывод и код 0
 STUB
     # flock -n FD — настоящий flock(2) на унаследованном дескрипторе, как у util-linux
     cat > "$F/bin/flock" <<'STUB'
@@ -364,6 +366,34 @@ STUB
           "$(fwb 'ssh-harden-rollback.timer' | grep -c 'чужая страховка: ssh-harden-rollback.timer')"
     check "проверка стоит перед взводом na-fw-safety, до nft -f" 1 \
           "$(grep -A1 '^fw_busy_check$' "$PROTECT" | grep -c '^arm_safety$')"
+    # ревью Codex N2 (29.09): упавший systemctl давал пустой список — применение шло;
+    # таймер отработал, а его откат (.service) ещё идёт — проверка его не видела
+    check "systemctl list-units отказал — отказ, а не «свободно»" 1 \
+          "$(fwb '' FWB_SYSTEMCTL_FAIL=1 | grep -c 'не смог проверить чужие страховки')"
+    check "идёт откат fw-safety.service — отказ" 1 \
+          "$(fwb 'fw-safety.service' | grep -c 'чужая страховка: fw-safety.service')"
+    check "идёт откат ssh-harden-rollback.service — отказ" 1 \
+          "$(fwb 'ssh-harden-rollback.service' | grep -c 'чужая страховка: ssh-harden-rollback.service')"
+    check "nohup-страховка закрывает обе блокировки (fd 8 и protect.lock на fd 9)" 1 \
+          "$(grep -c '2>&1 8>&- 9>&- &$' "$PROTECT")"
+fi
+
+# ─── 8. Хелпер na-scanner-update: оборванный whois (ревью Codex N2, 29.09) ─────
+# _whois_v4 отдавал код awk: whois, оборванный timeout после первых строк, возвращал
+# огрызок как полный список, и тот перезаписывал исправный кэш ASN.
+echo "== 8. na-scanner-update: оборванный whois — отказ, а не огрызок =="
+awk '/^_whois_v4\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$PROTECT" > "$T/whois.sh"
+if ! grep -q '^_whois_v4()' "$T/whois.sh"; then
+    checkf "нет _whois_v4 в $PROTECT"
+else
+    W="$T/wh"; mkdir -p "$W/bin"
+    printf '#!/bin/sh\nprintf "route: 198.51.100.0/24\\nroute: 203.0.113.0/24\\n"\n' > "$W/bin/whois"
+    # timeout: команда отработала, код — из WH_RC (124 — не уложился и убит)
+    printf '#!/bin/sh\nwhile [ "${1#-}" != "$1" ]; do shift; done\nshift\n"$@"\nexit "${WH_RC:-0}"\n' > "$W/bin/timeout"
+    chmod +x "$W/bin/whois" "$W/bin/timeout"
+    wh() { env PATH="$W/bin:$PATH" WH_RC="$1" WHOIS_TIMEOUT=5 "$WBASH" -c ". '$T/whois.sh'; _whois_v4 AS64500; echo rc=\$?" 2>&1 | paste -sd' ' -; }
+    check "whois уложился — оба префикса" "198.51.100.0/24 203.0.113.0/24 rc=0" "$(wh 0)"
+    check "whois оборван timeout (124) — ничего и код ≠ 0" "rc=1" "$(wh 124)"
 fi
 
 # ─── 7. PORTSCAN_SKIP_PORTS: анти-скан не считает клиентские порты ───────────

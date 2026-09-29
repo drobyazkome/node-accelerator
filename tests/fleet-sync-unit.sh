@@ -205,6 +205,18 @@ bash "$T/na-fleet-sync"
 grep -qF '203.0.113.77' "$REC/nft.applied"; check $? "relay.example.net остался в whitelist по кэшу"
 grep -qF 'взято из кэша' "$REC/logger.out"; check $? "в логе — что взято из кэша"
 
+echo "== A разрешился, AAAA отказал → IPv6 из кэша, штамп не ставится (ревью Codex N2) =="
+# до 29.09 кэш читался, только когда не разрешилось ничего: живой A отключал кэш, и
+# IPv6 узла выпадал из na_fleet_v6 со штампом полного успеха
+reset5; printf '203.0.113.10\nrelay.example.net\n' > "$REC/fixture.txt"
+printf 'relay.example.net 203.0.113.77\nrelay.example.net 2001:db8::77\n' > "$T/state/fleet-dns.cache"
+bash "$T/na-fleet-sync"
+grep -qF '203.0.113.77' "$REC/nft.applied"; check $? "IPv4 — живой"
+grep -qF '2001:db8::77' "$REC/nft.applied"; check $? "IPv6 — из кэша, не выпал"
+grep -qF 'relay.example.net(v6)' "$REC/logger.out"; check $? "в логе — какая семья взята из кэша"
+[ ! -f "$T/state/fleet-sync.last" ]; check $? "взятое из кэша — штамп успеха не ставится"
+grep -qF 'relay.example.net 2001:db8::77' "$T/state/fleet-dns.cache"; check $? "IPv6 остался в кэше"
+
 echo "== новое имя не разрешилось и кэша нет → без него, штамп не ставится =="
 reset5; touch "$REC/dns.down"; printf '203.0.113.10\nnew.example.net\n' > "$REC/fixture.txt"
 bash "$T/na-fleet-sync"

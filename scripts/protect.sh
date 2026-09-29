@@ -525,8 +525,11 @@ arm_safety() {
     mkdir -p "$STATE_DIR"
     local pidf="$STATE_DIR/na-fw-safety.pid" logf="$STATE_DIR/na-fw-safety.log"
     [[ -f "$pidf" && ! -L "$pidf" ]] && { kill "$(cat "$pidf")" 2>/dev/null || true; }
+    # 8>&- 9>&-: без них страховка держала бы обе блокировки — fleet-fw-apply (fd 8) и
+    # protect.lock (fd 9) — до конца своего sleep, и следующий прогон отказывал бы
+    # «уже идёт» (ревью Codex N2, 29.09)
     nohup sh -c 'sleep "$1"; /usr/local/sbin/na-fw-safety-revert 2>/dev/null; rm -f "$2"' \
-        _ "$SAFETY_DELAY" "$pidf" >"$logf" 2>&1 8>&- &
+        _ "$SAFETY_DELAY" "$pidf" >"$logf" 2>&1 8>&- 9>&- &
     echo $! > "$pidf"
     ok "safety: nohup pid $(cat "$pidf")"
 }
@@ -557,9 +560,19 @@ fw_busy_check() {
             exit 1
         fi
     fi
-    for u in $(systemctl list-units --state=active,activating --no-legend --plain \
-                   'fw-apply-safety-*.timer' 'fw-apply-safety-*.service' fw-safety.timer ssh-harden-rollback.timer \
-                   2>/dev/null | awk '{print $1}'); do
+    # Список — с проверкой кода: упавший systemctl давал пустой список, и применение шло
+    # мимо чужой страховки. Юниты .service тоже: таймер уже отработал, а его откат ещё
+    # идёт (ревью Codex N2, 29.09). Без systemd чужих systemd-страховок нет.
+    command -v systemctl >/dev/null 2>&1 || return 0
+    local units
+    if ! units="$(systemctl list-units --state=active,activating --no-legend --plain \
+                      'fw-apply-safety-*.timer' 'fw-apply-safety-*.service' \
+                      fw-safety.timer fw-safety.service \
+                      ssh-harden-rollback.timer ssh-harden-rollback.service 2>/dev/null)"; then
+        err "не смог проверить чужие страховки: systemctl list-units отказал — применение не иду"
+        exit 1
+    fi
+    for u in $(printf '%s\n' "$units" | awk '{print $1}'); do
         [[ -n "${FWA_UNIT:-}" && "$u" == "$FWA_UNIT".* ]] && continue
         busy+=" $u"
     done
@@ -1232,6 +1245,10 @@ ExecReload=/usr/sbin/nft -f $NFT_FILE
 ExecReload=-/usr/sbin/nft -f /var/lib/node-accelerator/scanner-cache.nft
 ExecReload=-/usr/sbin/nft -f /var/lib/node-accelerator/scanner-cache-tspu.nft
 ExecReload=-/usr/sbin/nft -f /var/lib/node-accelerator/fleet-cache.nft
+# загрузка: набор флота — сразу за таблицей и независимо от сканеров. Раньше его
+# возвращал только na-scanner-restore с условием «есть кэш сканеров»: без этого кэша
+# и при ENABLE_SCANNERS=0 флот стоял пустым до первого синка (ревью Codex N2, 29.09)
+ExecStartPost=-/usr/sbin/nft -f /var/lib/node-accelerator/fleet-cache.nft
 
 [Install]
 WantedBy=multi-user.target
@@ -1461,16 +1478,24 @@ while IFS= read -r a; do
     if printf '%s' "$a" | grep -qE '^[0-9a-fA-F:]+$' && printf '%s' "$a" | grep -q ':'; then echo "$a" >> "$TMP/v6"; continue; fi
     r4="$(getent ahostsv4 "$a" 2>/dev/null | awk '{print $1}' | grep -E "$V4RE" | sort -u)"
     r6="$(getent ahostsv6 "$a" 2>/dev/null | awk '{print $1}' | grep -E '^[0-9a-fA-F:]+$' | grep ':' | sort -u)"
-    if [ -z "$r4$r6" ] && [ -r "$DNSC" ]; then
-        r4="$(awk -v h="$a" '$1==h && $2 !~ /:/ {print $2}' "$DNSC")"
-        r6="$(awk -v h="$a" '$1==h && $2 ~ /:/ {print $2}' "$DNSC")"
-        [ -n "$r4$r6" ] && cached="$cached $a"
+    # Кэш — по каждой семье отдельно: до 29.09 он читался, только когда не разрешилось
+    # ничего, и отказ AAAA при живом A выкидывал IPv6 узла из набора со штампом успеха
+    # (ревью Codex N2). Взятое из кэша — не полный успех: штамп тогда не ставится.
+    if [ -r "$DNSC" ]; then
+        c=""
+        if [ -z "$r4" ]; then
+            r4="$(awk -v h="$a" '$1==h && $2 !~ /:/ {print $2}' "$DNSC")"; [ -n "$r4" ] && c="$c v4"
+        fi
+        if [ -z "$r6" ]; then
+            r6="$(awk -v h="$a" '$1==h && $2 ~ /:/ {print $2}' "$DNSC")"; [ -n "$r6" ] && c="$c v6"
+        fi
+        [ -n "$c" ] && cached="$cached $a(${c# })"
     fi
     [ -n "$r4$r6" ] || { unres="$unres $a"; continue; }
     for x in $r4; do echo "$x" >> "$TMP/v4"; echo "$a $x" >> "$TMP/dns.new"; done
     for x in $r6; do echo "$x" >> "$TMP/v6"; echo "$a $x" >> "$TMP/dns.new"; done
 done < "$TMP/addr"
-[ -n "$cached" ] && logger -t "$TAG" "DNS не ответил, взято из кэша:$cached"
+[ -n "$cached" ] && logger -t "$TAG" "DNS не ответил, взято из кэша:$cached — штамп не ставлю"
 [ -n "$unres" ] && logger -t "$TAG" "не разрешены и нет в кэше:$unres — без них, штамп не ставлю"
 V4="$(grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' "$TMP/v4" 2>/dev/null | sort -u | paste -sd, -)"
 V6="$(grep -E '^[0-9a-fA-F:]+$' "$TMP/v6" 2>/dev/null | grep ':' | sort -u | paste -sd, -)"
@@ -1494,7 +1519,7 @@ n4=$(printf '%s' "$V4" | tr ',' '\n' | grep -c . || true)
 n6=$(printf '%s' "$V6" | tr ',' '\n' | grep -c . || true)
 if nft -f "$TMP/upd.nft" 2>/dev/null; then
     mkdir -p /var/lib/node-accelerator
-    [ -n "$unres" ] || date +%s > "$STAMP"
+    [ -n "$unres$cached" ] || date +%s > "$STAMP"
     # кэш набора — для protect/reload/загрузки; кэш имён — для следующего отказа DNS
     cp -f "$TMP/upd.nft" /var/lib/node-accelerator/fleet-cache.nft 2>/dev/null || true
     [ -s "$TMP/dns.new" ] && cp -f "$TMP/dns.new" "$DNSC" 2>/dev/null
@@ -1798,11 +1823,16 @@ _ripestat_v4() {
 }
 _whois_v4() {
     command -v whois >/dev/null 2>&1 || return 1
+    # Ответ целиком и с кодом, потом разбор: в конвейере код был у awk, и whois,
+    # оборванный timeout (124) после первых строк, отдавал огрызок как полный список —
+    # он перезаписывал исправный кэш ASN (ревью Codex N2, 29.09).
+    local out
     if command -v timeout >/dev/null 2>&1; then
-        timeout --kill-after=5 "$WHOIS_TIMEOUT" whois -h whois.radb.net -- "-i origin $1" 2>/dev/null
+        out="$(timeout --kill-after=5 "$WHOIS_TIMEOUT" whois -h whois.radb.net -- "-i origin $1" 2>/dev/null)" || return 1
     else
-        whois -h whois.radb.net -- "-i origin $1" 2>/dev/null
-    fi | awk '/^route:/{print $2}'
+        out="$(whois -h whois.radb.net -- "-i origin $1" 2>/dev/null)" || return 1
+    fi
+    printf '%s\n' "$out" | awk '/^route:/{print $2}'
 }
 
 n_asn=0; n_skip=0
@@ -1818,7 +1848,8 @@ if [ -r "$ASN_FILE" ]; then
         # Отказ RIPE и whois — префиксы прошлого удачного резолва: до 25.09 ASN
         # молча выпадал из набора на весь тик (ревью Codex).
         if [ -n "$pfx" ]; then
-            printf '%s\n' "$pfx" > "$AC/$asn" 2>/dev/null
+            # замена целиком: оборванная запись не должна оставить полкэша
+            printf '%s\n' "$pfx" > "$AC/$asn.tmp" 2>/dev/null && mv -f "$AC/$asn.tmp" "$AC/$asn" 2>/dev/null
         elif [ -s "$AC/$asn" ]; then
             pfx="$(cat "$AC/$asn")"; logger -t "$TAG" "$asn: префиксы не получены — взяты из кэша"
         else
@@ -1948,7 +1979,6 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /var/lib/node-accelerator/scanner-cache.nft
 ExecStart=-/usr/sbin/nft -f /var/lib/node-accelerator/scanner-cache-tspu.nft
-ExecStart=-/usr/sbin/nft -f /var/lib/node-accelerator/fleet-cache.nft
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -1986,6 +2016,10 @@ NA_CTG_PHANTOM_MIN=${NA_CTG_PHANTOM_MIN:-4000}
 NA_CTG_LIVE_FLOOR=${NA_CTG_LIVE_FLOOR:-2}
 NA_CTG_BANTIME=${NA_CTG_BANTIME:-15m}
 NA_CTG_COARSE_MULT=${NA_CTG_COARSE_MULT:-3}
+# Источник whitelist: na_filter — наборы фаервола (whitelist и флот); conf — при
+# FW_MODE=skip таблицы na_filter нет, список WHITELIST ведёт своя таблица na_ctguard
+NA_CTG_WL_SRC=$([[ "$FW_MODE" == "skip" ]] && echo conf || echo na_filter)
+NA_CTG_WHITELIST="${WHITELIST//[^0-9a-fA-F.:\/,]/}"
 EOF
     chmod 0640 "$CONF_DIR/ctguard.conf"
     cat > /usr/local/sbin/na-ctguard <<'CTG'
@@ -2030,8 +2064,27 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 ss -tnH state established > "$TMP/ss" 2>/dev/null || { logger -t "$TAG" "ss не отработал — тик без эвиктов"; exit 1; }
 ip -o addr show scope global > "$TMP/addr" 2>/dev/null && [ -s "$TMP/addr" ] \
     || { logger -t "$TAG" "адреса узла не прочитаны (ip) — тик без эвиктов"; exit 1; }
-nft list set inet na_filter whitelist_v4 >/dev/null 2>&1 \
-    || { logger -t "$TAG" "whitelist na_filter не читается — тик без эвиктов"; exit 1; }
+# Whitelist — из источника, заданного при установке (ревью Codex N2, 29.09): при
+# FW_MODE=skip таблицы na_filter нет, и обязательная сверка с ней кончала каждый тик
+# отказом. Там список WHITELIST держит своя таблица; неполный whitelist — тик без эвиктов.
+if [ "${NA_CTG_WL_SRC:-na_filter}" = conf ]; then
+    W4="$(printf '%s' "${NA_CTG_WHITELIST:-}" | tr ',' '\n' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' | paste -sd, -)"
+    W6="$(printf '%s' "${NA_CTG_WHITELIST:-}" | tr ',' '\n' | grep -E '^[0-9a-fA-F:]*:[0-9a-fA-F:]*(/[0-9]{1,3})?$' | paste -sd, -)"
+    { echo "add set inet na_ctguard white_v4 { type ipv4_addr; flags interval; auto-merge; }"
+      echo "add set inet na_ctguard white_v6 { type ipv6_addr; flags interval; auto-merge; }"
+      echo "flush set inet na_ctguard white_v4"
+      echo "flush set inet na_ctguard white_v6"
+      [ -n "$W4" ] && echo "add element inet na_ctguard white_v4 { $W4 }"
+      [ -n "$W6" ] && echo "add element inet na_ctguard white_v6 { $W6 }"
+    } > "$TMP/white.nft"
+    nft -f "$TMP/white.nft" 2>/dev/null \
+        || { logger -t "$TAG" "whitelist в na_ctguard не залит — тик без эвиктов"; exit 1; }
+    WLT=na_ctguard; WL4=white_v4; WL6=white_v6; FL4=""; FL6=""
+else
+    nft list set inet na_filter whitelist_v4 >/dev/null 2>&1 \
+        || { logger -t "$TAG" "whitelist na_filter не читается — тик без эвиктов"; exit 1; }
+    WLT=na_filter; WL4=whitelist_v4; WL6=whitelist_v6; FL4=na_fleet_v4; FL6=na_fleet_v6
+fi
 CT_TOTAL="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)"
 SS_TOTAL="$(wc -l < "$TMP/ss")"
 # коарс-гейт: дорогой дамп только если conntrack заметно больше живых сокетов И велик
@@ -2061,11 +2114,11 @@ conntrack -L -p tcp 2>/dev/null \
   | grep -Ev "^(${SELF_RE})$" | grep -Ev "$PRIV_RE" \
   | sort | uniq -c | sort -rn > "$TMP/ct"
 
-is_white() {  # в whitelist na_filter или в fleet-сете?
-    local ip="$1" s4 s6
-    if printf '%s' "$ip" | grep -q ':'; then s4=whitelist_v6; s6=na_fleet_v6; else s4=whitelist_v4; s6=na_fleet_v4; fi
-    nft get element inet na_filter "$s4" "{ $ip }" >/dev/null 2>&1 && return 0
-    nft get element inet na_filter "$s6" "{ $ip }" >/dev/null 2>&1 && return 0
+is_white() {  # в whitelist (na_filter или свой при FW_MODE=skip) или в fleet-сете?
+    local ip="$1" w f
+    if printf '%s' "$ip" | grep -q ':'; then w=$WL6; f=$FL6; else w=$WL4; f=$FL4; fi
+    nft get element inet "$WLT" "$w" "{ $ip }" >/dev/null 2>&1 && return 0
+    [ -n "$f" ] && nft get element inet na_filter "$f" "{ $ip }" >/dev/null 2>&1 && return 0
     return 1
 }
 cand=0; eict=0

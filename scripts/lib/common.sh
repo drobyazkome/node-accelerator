@@ -6,7 +6,7 @@
 # Версия тулкита — ЕДИНСТВЕННЫЙ источник. Пишется в installed-маркеры и отдаётся
 # в na-diagnose/na-report --json, чтобы флот-мониторинг видел version-drift по нодам.
 # shellcheck disable=SC2034
-NA_VERSION="4.1.5-rw1"
+NA_VERSION="4.1.6-rw1"
 
 # shellcheck disable=SC2034
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -396,14 +396,26 @@ conf_stale_defaults() {
     return 0
 }
 
+# Ключи, у которых пустое значение — осмысленный выбор: PORTSCAN_SKIP_PORTS="" —
+# гвард считает все порты. Идиома `:=` в файле заменяла заданную в ENV пустоту
+# сохранённым значением, и отменить исключение без правки файла было нельзя (ревью
+# Codex N2, 29.09). Такие ключи пишутся как `${K=…}`, а заданное ENV, даже пустое,
+# load_conf возвращает поверх старого файла.
+NA_CONF_EMPTY_OK="PORTSCAN_SKIP_PORTS"
+
 # load_conf <file> — подхватить сохранённый конфиг (no-op если файла нет), затем
 # доложить о замороженных дефолтах (или принять новые при NA_ADOPT_NEW_DEFAULTS=1).
 load_conf() {
-    local f="$1" k old new ver why cur
+    local f="$1" k old new ver why cur n _keep=""
     conf_note_env_keys
     [[ -n "$f" && -f "$f" && ! -L "$f" ]] || return 0
+    for k in $NA_CONF_EMPTY_OK; do
+        [[ -v "$k" ]] || continue
+        printf -v "_na_keep_$k" '%s' "${!k}"; _keep+=" $k"
+    done
     # shellcheck disable=SC1090
     . "$f"
+    for k in $_keep; do n="_na_keep_$k"; printf -v "$k" '%s' "${!n}"; done
     while IFS='|' read -r k old new ver why; do
         [[ -n "$k" ]] || continue
         [[ " $NA_CONF_ENV_KEYS " == *" $k "* ]] && continue      # оператор задал сейчас
@@ -440,7 +452,11 @@ save_conf() {
                 *'"'*|*'`'*|*'$'*|*'}'*|*$'\n'*)
                     warn "node.conf: пропускаю $k (спецсимволы в значении)"; continue;;
             esac
-            printf ': "${%s:=%s}"\n' "$k" "$v"
+            if [[ " $NA_CONF_EMPTY_OK " == *" $k "* ]]; then
+                printf ': "${%s=%s}"\n' "$k" "$v"      # пустое из ENV переживает чтение
+            else
+                printf ': "${%s:=%s}"\n' "$k" "$v"
+            fi
         done
         while IFS='|' read -r k _o _n _v _w; do
             [[ -n "$k" ]] || continue

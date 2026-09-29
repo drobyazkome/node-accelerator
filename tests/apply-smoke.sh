@@ -97,6 +97,8 @@ done
 for f in conf/protect.conf conf/ctguard.conf conf/fleet.env sbin/na-fleet-sync sbin/na-blocklist-update sbin/na-ctguard; do
     [ -e "$T/$f" ] || { echo "[x] не создан артефакт: $f"; fail=1; }
 done
+grep -q '^NA_CTG_WL_SRC=na_filter$' "$T/conf/ctguard.conf" 2>/dev/null \
+    || { echo "[x] strict: ctguard должен брать whitelist из na_filter"; fail=1; }
 # strict (дефолт): policy drop, анти-скан и node-port правила на месте, fw_mode в маркере
 NFTF="$T/conf/na_filter.nft"
 grep -q 'hook input priority filter; policy drop;' "$NFTF" || { echo "[x] strict: нет policy drop на input"; fail=1; }
@@ -156,6 +158,9 @@ grep -qiE 'unbound variable|bad substitution' "$LOG3" && { echo "[x] skip: unbou
 [ ! -e "$T/sbin/na-fleet-sync" ] || { echo "[x] skip: fleet-sync должен быть пропущен"; fail=1; }
 [ ! -e "$T/sbin/na-blocklist-update" ] || { echo "[x] skip: блоклисты должны быть пропущены"; fail=1; }
 [ -e "$T/sbin/na-ctguard" ] || { echo "[x] skip: ctguard независим от na_filter — должен ставиться"; fail=1; }
+# ревью Codex N2 (29.09): whitelist ctguard при skip — из conf, не из несуществующей na_filter
+grep -q '^NA_CTG_WL_SRC=conf$' "$T/conf/ctguard.conf" 2>/dev/null \
+    || { echo "[x] skip: ctguard должен брать whitelist из conf (таблицы na_filter нет)"; fail=1; }
 grep -qF 'Как закрыть порты самому' "$LOG3" || { echo "[x] skip: не напечатана инструкция по ручной блокировке"; fail=1; }
 grep -qF 'Готово' "$LOG3" || { echo "[x] skip: прогон не дошёл до конца"; fail=1; }
 grep -q '^fw_mode=skip$' "$T/state/protect.installed" || { echo "[x] skip: fw_mode=skip не в маркере"; fail=1; }

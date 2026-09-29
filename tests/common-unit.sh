@@ -133,6 +133,22 @@ printf ': "${CROWDSEC_STRICT:=0}"\n' > "$T/etc/second.conf"
 OUT="$(run "load_conf '$CONF' >/dev/null; load_conf '$T/etc/second.conf'")"
 check "второй load_conf: ключ из первого файла — не ENV (warn есть)" 1 "$(printf '%s\n' "$OUT" | grep -c 'записан старой версией')"
 
+echo "== 6. PORTSCAN_SKIP_PORTS: пустое значение из ENV — осмысленный выбор (ревью Codex N2) =="
+# старый conf (v4.1.5-rw1) с идиомой := — пустое ENV им не перебивалось, и отменить
+# исключение клиентских портов у гварда без правки файла было нельзя
+printf ': "${PORTSCAN_SKIP_PORTS:=443,8444}"\n' > "$CONF"
+check "ENV пустое поверх старого conf — остаётся пустым" "VAL=<>" \
+      "$(run "export PORTSCAN_SKIP_PORTS=''; load_conf '$CONF'; echo \"VAL=<\$PORTSCAN_SKIP_PORTS>\"")"
+check "ENV не задано — значение из conf" "VAL=<443,8444>" \
+      "$(run "unset PORTSCAN_SKIP_PORTS; load_conf '$CONF'; echo \"VAL=<\$PORTSCAN_SKIP_PORTS>\"")"
+check "ENV задано — ENV" "VAL=<443>" \
+      "$(run "export PORTSCAN_SKIP_PORTS=443; load_conf '$CONF'; echo \"VAL=<\$PORTSCAN_SKIP_PORTS>\"")"
+OUT="$(run "export PORTSCAN_SKIP_PORTS=''; load_conf '$CONF'; save_conf '$CONF' PORTSCAN_SKIP_PORTS CONN_LIMIT; cat '$CONF'")"
+check "save_conf пишет ключ идиомой = (пустое переживает чтение)" 1 "$(printf '%s\n' "$OUT" | grep -c '^: "${PORTSCAN_SKIP_PORTS=}"$')"
+check "остальные ключи — по-прежнему :="                          1 "$(printf '%s\n' "$OUT" | grep -c '^: "${CONN_LIMIT:=')"
+check "новый conf: пустое сохранено, без ENV так и читается" "VAL=<>" \
+      "$(run "unset PORTSCAN_SKIP_PORTS; load_conf '$CONF'; echo \"VAL=<\$PORTSCAN_SKIP_PORTS>\"")"
+
 echo
 echo "итого: ok=$PASS fail=$FAIL"
 [[ "$FAIL" -eq 0 ]]

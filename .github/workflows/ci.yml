@@ -186,7 +186,8 @@ jobs:
           bash scripts/diagnose.sh --json | jq -e . >/dev/null || { echo "diagnose --json не парсится jq"; exit 1; }
           bash scripts/diagnose.sh --json | grep -q '"na_version":"' || { echo "diagnose --json без na_version"; exit 1; }
           bash scripts/na-report.sh --json | jq -e . >/dev/null || { echo "na-report --json не парсится jq"; exit 1; }
-          P="$(bash scripts/na-report.sh --proxyware --json)"
+          # код — вердикт: в контейнере нет systemd, отчёт честно неполный (2); индикаторы (1) — провал
+          P="$(bash scripts/na-report.sh --proxyware --json)" || [ $? -eq 2 ] || { echo "--proxyware: нашёл индикаторы или упал"; exit 1; }
           [ "$(printf '%s\n' "$P" | wc -l)" -eq 1 ] || { echo "--proxyware --json должен быть ОДНОЙ строкой"; exit 1; }
           printf '%s' "$P" | jq -e . >/dev/null || { echo "--proxyware --json не парсится jq"; exit 1; }
           echo "ok: все --json валидны, na_version присутствует"

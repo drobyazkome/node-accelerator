@@ -19,6 +19,9 @@
 #      чужая страховка; под оркестратором (FWA_UNIT) его блокировка — не помеха.
 #   7. PORTSCAN_SKIP_PORTS (28.09.2026): правила бана анти-скана не считают клиентские
 #      порты, лог-правило считает все; без ручки — как в апстриме; мусор — отказ.
+#   9. SSH_NET_RATE и OBS_NET_PORTS (29.09.2026): /24-метры syn4net_22 и obs4net
+#      генерирует шаблон — на своих местах в цепочке, с именами, по которым их сверяет
+#      vpn; без ручек — как в апстриме; мусор — отказ; ре-ран без ENV их не снимает.
 #
 # Не требует root/сети/nft/systemd. Запуск: bash tests/protect-unit.sh
 # Проверить на старой версии:  NA_PROTECT_SH=<путь> bash tests/protect-unit.sh  (упадёт)
@@ -250,7 +253,8 @@ cp "$PROTECT" "$A/scripts/protect.sh"
 sed -e "s#/etc/systemd/system/#$A/sys/#g" -e "s#/usr/local/sbin/#$A/sbin/#g" \
     -e "s#/etc/modules-load.d/#$A/modload/#g" -e "s#/etc/crowdsec#$A/crowdsec#g" \
     "$A/scripts/protect.sh" > "$A/p.tmp" && mv "$A/p.tmp" "$A/scripts/protect.sh"
-for c in systemctl modprobe nft systemd-run sysctl conntrack cscli sleep; do
+# ip — стаб и здесь: на маке его нет, и сборка OUTPUT_RULES роняла apply с кодом 127
+for c in systemctl modprobe nft systemd-run sysctl conntrack cscli sleep ip; do
     printf '#!/bin/sh\nexit 0\n' > "$A/bin/$c"; chmod +x "$A/bin/$c"
 done
 for c in curl docker ss dpkg apt-get; do
@@ -402,7 +406,6 @@ fi
 # и минуты между ре-раном и правкой клиенты были под баном (28.09.2026). Генерация —
 # DRY_RUN копии из раздела 5; `ip` — стаб (маршрута по умолчанию на стенде нет).
 echo "== 7. PORTSCAN_SKIP_PORTS: исключение клиентских портов в правилах гварда =="
-printf '#!/bin/sh\nexit 0\n' > "$A/bin/ip"; chmod +x "$A/bin/ip"
 gen() {   # gen [ПЕРЕМЕННАЯ=значение…] → путь сгенерированного na_filter или «нет файла» и вывод
     local out f
     out=$(env PATH="$A/bin:$PATH" REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=1 FW_MODE=strict ENABLE_CROWDSEC=0 "$@" \
@@ -441,6 +444,86 @@ out=$(gen 'PORTSCAN_SKIP_PORTS=443;rm -rf /')
 check "мусор в PORTSCAN_SKIP_PORTS — отказ до генерации" "нет файла 1" \
       "$(printf '%s\n' "$out" | head -1) $(printf '%s\n' "$out" | grep -c 'ждал порты через запятую')"
 check "ручка сохраняется в protect.conf (save_conf)" 1 "$(grep -c ' PORTSCAN_SKIP_PORTS ' "$PROTECT")"
+
+# ─── 9. /24-метры syn4net_22 и obs4net из шаблона ───────────────────────────
+# Флот ставил их скриптом subnet-meter-rollout (vpn) после каждого ре-рана protect, и
+# до этой правки их не было (29.09.2026). Имена метров прежние: по ним сверяют
+# fleet-consistency, node-facts и na-perekatka-verify (vpn), а subnet-meter-rollout
+# находит правило и не ставит второе. Генерация — та же gen из раздела 7.
+echo "== 9. SSH_NET_RATE и OBS_NET_PORTS: /24-метры в шаблоне =="
+line() { grep -n -e "$1" "$2" | head -1 | cut -d: -f1; }
+f=$(gen SSH_NET_RATE=20 SSH_NET_BURST=40 OBS_NET_PORTS=443,8444 TCP_PORTS=443,8444 | head -1)
+if [[ ! -f "$f" ]]; then
+    checkf "DRY_RUN с /24-метрами не дал файла: $(gen SSH_NET_RATE=20 OBS_NET_PORTS=443 | tail -2)"
+else
+    check "syn4net_22: /24, 20 в минуту, burst 40, drop" 1 \
+          "$(grep -cF 'tcp dport { 22 } ct state new meter syn4net_22 size 65535 { ip saddr and 255.255.255.0 limit rate over 20/minute burst 40 packets } drop' "$f")"
+    s=$(line 'meter syn4net_22 ' "$f"); h=$(line 'meter ssh4 ' "$f")
+    check "syn4net_22 стоит перед пер-IP ssh4" 1 "$(( ${s:-0} > 0 && ${s:-0} < ${h:-0} ))"
+    check "obs4net: клиентские порты, 300 в минуту, burst 600, лог [na subnet-client]" 1 \
+          "$(grep -cF 'tcp dport { 443, 8444 } ct state new meter obs4net size 65535 { ip saddr and 255.255.255.0 limit rate over 300/minute burst 600 packets } limit rate 5/second log prefix "[na subnet-client] " level info' "$f")"
+    o=$(line 'meter obs4net ' "$f"); c=$(line '# сервисные TCP-порты' "$f"); k=$(line 'meter cc4_' "$f")
+    check "obs4net под комментарием сервисных портов и до первого cc4_ (якоря subnet-meter-rollout)" 1 \
+          "$(( ${c:-0} > 0 && ${c:-0} < ${o:-0} && ${o:-0} < ${k:-0} ))"
+    check "у obs4net нет вердикта — только лог" 0 "$(grep 'meter obs4net ' "$f" | grep -cE ' (drop|accept)$')"
+    rm -f "$f"
+fi
+f=$(gen | head -1)
+if [[ -f "$f" ]]; then
+    check "без ручек — как в апстриме: ни syn4net_22, ни obs4net" "0 0" \
+          "$(grep -c 'syn4net_22' "$f") $(grep -c 'obs4net' "$f")"
+    rm -f "$f"
+else
+    checkf "DRY_RUN без ручек не дал файла"
+fi
+out=$(env PATH="$A/bin:$PATH" REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=1 FW_MODE=strict ENABLE_CROWDSEC=0 \
+      OBS_NET_PORTS=443,8444 TCP_PORTS=443,2087 "$WBASH" "$A/scripts/protect.sh" 2>&1) || true
+check "порт наблюдения вне TCP_PORTS — предупреждение с номером" 1 \
+      "$(printf '%s\n' "$out" | grep -c 'OBS_NET_PORTS: порта 8444 нет в TCP_PORTS')"
+rm -f "$(printf '%s\n' "$out" | sed -n 's/.*Посмотреть: cat //p' | tail -1)"
+out=$(gen 'OBS_NET_PORTS=443;rm -rf /')
+check "мусор в OBS_NET_PORTS — отказ до генерации" "нет файла 1" \
+      "$(printf '%s\n' "$out" | head -1) $(printf '%s\n' "$out" | grep -c 'OBS_NET_PORTS:')"
+out=$(gen SSH_NET_RATE=abc)
+check "SSH_NET_RATE не число — отказ" "нет файла 1" \
+      "$(printf '%s\n' "$out" | head -1) $(printf '%s\n' "$out" | grep -c "SSH_NET_RATE='abc'")"
+out=$(gen SSH_NET_RATE=20 SSH_NET_BURST=0)
+check "включённый метр с burst 0 — отказ" "нет файла 1" \
+      "$(printf '%s\n' "$out" | head -1) $(printf '%s\n' "$out" | grep -c 'SSH_NET_BURST=0 при SSH_NET_RATE=20')"
+out=$(gen OBS_NET_PORTS=443 OBS_NET_RATE=0)
+check "наблюдение с порогом 0 — отказ" "нет файла 1" \
+      "$(printf '%s\n' "$out" | head -1) $(printf '%s\n' "$out" | grep -c 'OBS_NET_RATE=0 ')"
+check "пять ручек сохраняются в protect.conf (save_conf)" 1 \
+      "$(grep -c ' SSH_NET_RATE SSH_NET_BURST OBS_NET_PORTS OBS_NET_RATE OBS_NET_BURST ' "$PROTECT")"
+check "пустой OBS_NET_PORTS из ENV переживает чтение conf (NA_CONF_EMPTY_OK)" 1 \
+      "$(grep -cE '^NA_CONF_EMPTY_OK=".* OBS_NET_PORTS( |")' "$REPO_ROOT/scripts/lib/common.sh")"
+# Полный apply с ручками, затем ре-ран без ENV: метры берутся из protect.conf. Раздел
+# последний — дальше этот conf никому не мешает.
+set +e
+PATH="$A/bin:$PATH" SSH_NET_RATE=20 SSH_NET_BURST=40 OBS_NET_PORTS=443 TCP_PORTS=443 ENABLE_CROWDSEC=0 \
+    NA_FWA_LOCK="$A/state/fleet-fw-apply.lock" REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 \
+    "$WBASH" "$A/scripts/protect.sh" >"$A/apply9.log" 2>&1
+rc=$?
+set -e
+check "apply с /24-метрами отработал (exit 0)" 0 "$rc"
+check "protect.conf: SSH_NET_RATE и OBS_NET_PORTS записаны" 2 \
+      "$(grep -cE '^: "\$\{(SSH_NET_RATE:=20|OBS_NET_PORTS=443)\}"$' "$A/conf/protect.conf")"
+f=$(gen | head -1)
+if [[ -f "$f" ]]; then
+    check "ре-ран без ENV: оба метра на месте (из protect.conf)" "1 1" \
+          "$(grep -c 'meter syn4net_22 ' "$f") $(grep -c 'meter obs4net ' "$f")"
+    rm -f "$f"
+else
+    checkf "ре-ран без ENV не дал файла"
+fi
+f=$(gen OBS_NET_PORTS= | head -1)
+if [[ -f "$f" ]]; then
+    check "пустой OBS_NET_PORTS в ENV снимает наблюдение поверх conf" "1 0" \
+          "$(grep -c 'meter syn4net_22 ' "$f") $(grep -c 'meter obs4net ' "$f")"
+    rm -f "$f"
+else
+    checkf "ре-ран с пустым OBS_NET_PORTS не дал файла"
+fi
 
 echo
 echo "итого: ok=$PASS fail=$FAIL"

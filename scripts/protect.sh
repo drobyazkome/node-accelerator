@@ -27,6 +27,12 @@
 #   CONN_LIMIT=2048                    макс. одновременных конн. с одного IP (ct count)
 #   SSH_RATE=6    SSH_BURST=5          per-IP новых SSH/мин до бана
 #   SSH_BAN_TIME=24h  PORTSCAN_BAN_TIME=1h
+#   SSH_NET_RATE=0 SSH_NET_BURST=40    новых SSH/мин с одной /24 до drop, без бана (метр
+#                                      syn4net_22): пер-IP лимит обходится перебором с целой
+#                                      подсети; 0 — правила нет, как в апстриме
+#   OBS_NET_PORTS=""                   клиентские TCP-порты под наблюдением по /24 (метр
+#   OBS_NET_RATE=300 OBS_NET_BURST=600 obs4net): сверх OBS_NET_RATE/мин новых с одной /24 —
+#                                      строка [na subnet-client], без drop; пусто — правила нет
 #   PORTSCAN_LOG_RATE=60               строк [na portscan] в МИНУТУ в журнал (0 = не
 #   PORTSCAN_LOG_BURST=30              логировать вовсе; на бан не влияет — он по meter'ам)
 #   ENABLE_PORTSCAN_BAN=1  ENABLE_CROWDSEC=1  ENABLE_SYNPROXY=0
@@ -96,6 +102,12 @@ CONN_LIMIT="${CONN_LIMIT:-2048}"
 ICMP_RATE="${ICMP_RATE:-10}"; ICMP_BURST="${ICMP_BURST:-20}"   # PER-IP (не глобально)
 SSH_RATE="${SSH_RATE:-6}";    SSH_BURST="${SSH_BURST:-5}"
 SSH_BAN_TIME="${SSH_BAN_TIME:-24h}"
+# /24-агрегация на SSH (форк, 29.09.2026). Пер-IP лимит SSH_RATE не видит перебор,
+# размазанный по подсети: двадцать адресов одной /24 по пять попыток — сотня в минуту.
+# Сверх SSH_NET_RATE/мин новых с одной /24 — drop без бана: бан /24 задел бы соседей
+# по CGNAT. Флот ставил это правило скриптом subnet-meter-rollout (vpn) после каждого
+# ре-рана protect; имя метра syn4net_22 оставлено для его сверок. 0 — правила нет.
+SSH_NET_RATE="${SSH_NET_RATE:-0}"; SSH_NET_BURST="${SSH_NET_BURST:-40}"
 PORTSCAN_BAN_TIME="${PORTSCAN_BAN_TIME:-1h}"
 # Порог автобана за скан: банить IP только если он бьёт по закрытым портам БЫСТРЕЕ
 # порога (реальный сканер). Одиночные шальные SYN из CGNAT-пула не банят весь оператор.
@@ -122,6 +134,12 @@ if [[ -n "$PORTSCAN_SKIP_PORTS" && ! "$PORTSCAN_SKIP_PORTS" =~ ^[0-9]{1,5}(,[0-9
     err "PORTSCAN_SKIP_PORTS=«${PORTSCAN_SKIP_PORTS}» — ждал порты через запятую, например 443,8444,2222"
     exit 1
 fi
+# Наблюдение по /24 на клиентских портах (форк, 29.09.2026): только лог, без drop.
+# Видно, когда одна подсеть открывает сверх OBS_NET_RATE новых соединений в минуту
+# (сканер, стенд, оператор с общим выходом), — до того, как решать про лимит. Правило
+# ставил subnet-meter-rollout (vpn), ре-ран protect его снимал. Пусто — правила нет.
+OBS_NET_PORTS="${OBS_NET_PORTS:-}"
+OBS_NET_RATE="${OBS_NET_RATE:-300}"; OBS_NET_BURST="${OBS_NET_BURST:-600}"
 ENABLE_CROWDSEC="${ENABLE_CROWDSEC:-1}"
 # CROWDSEC_STRICT=1 (дефолт с v4.0) — никакого curl|bash-фоллбэка: не поднялся
 # пиннингованный репо, значит CrowdSec просто не ставим. Фоллбэк форсируется атакующим
@@ -261,6 +279,7 @@ validate_port_list "$UDP_PORTS" UDP_PORTS || exit 1
 # Список, а не число: валидировать его как uint — значит уронить любой прогон с дефолтом
 # (пустая строка не uint), поэтому только validate_port_list, который пустое пропускает.
 validate_port_list "$UDP_BULK_PORTS" UDP_BULK_PORTS || exit 1
+validate_port_list "$OBS_NET_PORTS" OBS_NET_PORTS || exit 1
 # кэш прошлого детекта приходит из conf — битый молча сбрасываем (уйдёт в nft-ruleset)
 validate_port_list "$NODE_PORT_LAST" NODE_PORT_LAST 2>/dev/null || NODE_PORT_LAST=""
 
@@ -274,9 +293,18 @@ _is_duration() { [[ "$1" =~ ^[0-9]+(s|m|h|d)?$ ]]; }
 _is_systime()  { [[ "$1" =~ ^[0-9]+(s|sec|m|min|h|hr|d|day)?$ ]]; }
 for _k in SYN_RATE SYN_BURST UDP_RATE UDP_BURST UDP_BULK_RATE UDP_BULK_BURST CONN_LIMIT ICMP_RATE ICMP_BURST \
           SSH_RATE SSH_BURST PORTSCAN_RATE PORTSCAN_BURST PORTSCAN_LOG_RATE PORTSCAN_LOG_BURST SAFETY_DELAY \
+          SSH_NET_RATE SSH_NET_BURST OBS_NET_RATE OBS_NET_BURST \
           NA_CTG_PHANTOM_MIN NA_CTG_LIVE_FLOOR NA_CTG_COARSE_MULT; do
     _is_uint "${!_k}" || { err "$_k='${!_k}' — ожидается целое число"; exit 1; }
 done
+# включённому /24-метру нужны порог и запас больше нуля: «over 0/minute» режет или
+# пишет в журнал каждое новое соединение
+if (( SSH_NET_RATE > 0 && SSH_NET_BURST < 1 )); then
+    err "SSH_NET_BURST=$SSH_NET_BURST при SSH_NET_RATE=$SSH_NET_RATE — ожидается ≥ 1"; exit 1
+fi
+if [[ -n "$OBS_NET_PORTS" ]] && (( OBS_NET_RATE < 1 || OBS_NET_BURST < 1 )); then
+    err "OBS_NET_RATE=$OBS_NET_RATE OBS_NET_BURST=$OBS_NET_BURST при OBS_NET_PORTS=$OBS_NET_PORTS — ожидается ≥ 1"; exit 1
+fi
 for _k in SSH_BAN_TIME PORTSCAN_BAN_TIME SUSPECT_TIME NA_CTG_BANTIME; do
     _is_duration "${!_k}" || { err "$_k='${!_k}' — ожидается число с опц. суффиксом s|m|h|d"; exit 1; }
 done
@@ -979,6 +1007,23 @@ else
         tcp dport { ${SSH_NFT} } ct state new meta nfproto ipv6 add @autoban_v6 { ip6 saddr timeout ${SSH_BAN_TIME} } drop"
 fi
 
+# /24-метры (ручки — в «Параметрах»). syn4net_22 стоит перед пер-IP ssh4: подсеть,
+# перебирающая SSH со многих адресов, режется раньше, чем адреса получат свои квоты.
+# obs4net — перед cc4_/syn4_ сервисных портов; вердикта у него нет, только лог.
+SSH_NET_RULE=""
+if (( SSH_NET_RATE > 0 )); then
+    SSH_NET_RULE="        # SSH по /24: сверх ${SSH_NET_RATE}/мин новых с одной подсети — drop без бана
+        tcp dport { ${SSH_NFT} } ct state new meter syn4net_22 size 65535 { ip saddr and 255.255.255.0 limit rate over ${SSH_NET_RATE}/minute burst ${SSH_NET_BURST} packets } drop"
+fi
+OBS_NET_RULE=""
+if [[ -n "$OBS_NET_PORTS" ]]; then
+    OBS_NET_RULE="        # наблюдение по /24: сверх ${OBS_NET_RATE}/мин новых с одной подсети — лог, без drop
+        tcp dport { ${OBS_NET_PORTS//,/, } } ct state new meter obs4net size 65535 { ip saddr and 255.255.255.0 limit rate over ${OBS_NET_RATE}/minute burst ${OBS_NET_BURST} packets } limit rate 5/second log prefix \"[na subnet-client] \" level info"
+    for p in ${OBS_NET_PORTS//,/ }; do
+        [[ ",${TCP_PORTS}," == *",${p},"* ]] || warn "OBS_NET_PORTS: порта $p нет в TCP_PORTS — наблюдение по /24 для него, скорее всего, лишнее"
+    done
+fi
+
 WL4_LINE=""; [[ -n "$WL4" ]] && WL4_LINE="elements = { $WL4 }"
 WL6_LINE=""; [[ -n "$WL6" ]] && WL6_LINE="elements = { $WL6 }"
 
@@ -1112,9 +1157,11 @@ $ANTISPOOF
 
 $SYNPROXY_IN
 
+$SSH_NET_RULE
 $SSH_RULES
 
         # сервисные TCP-порты (per-IP лимиты)
+$OBS_NET_RULE
 $TCP_RULES
 
         # сервисные UDP-порты (per-IP лимиты)
@@ -2539,6 +2586,7 @@ save_conf "$CONF_DIR/protect.conf" \
     FW_MODE SSH_PORT TCP_PORTS UDP_PORTS NODE_PORT WHITELIST \
     SYN_RATE SYN_BURST UDP_RATE UDP_BURST UDP_BULK_PORTS UDP_BULK_RATE UDP_BULK_BURST CONN_LIMIT \
     ICMP_RATE ICMP_BURST SSH_RATE SSH_BURST SSH_BAN_TIME \
+    SSH_NET_RATE SSH_NET_BURST OBS_NET_PORTS OBS_NET_RATE OBS_NET_BURST \
     PORTSCAN_BAN_TIME PORTSCAN_RATE PORTSCAN_BURST PORTSCAN_LOG_RATE PORTSCAN_LOG_BURST PORTSCAN_SKIP_PORTS \
     ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC CROWDSEC_STRICT ENABLE_SYNPROXY \
     ENABLE_BLOCKLISTS BLOCK_TOR BLOCKLIST_REFRESH ENABLE_BANONCE SUSPECT_TIME \

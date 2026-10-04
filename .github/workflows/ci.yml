@@ -219,8 +219,12 @@ jobs:
           OUT="$(DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 TCP_PORTS=443,8444 \
                  SSH_NET_RATE=20 SSH_NET_BURST=40 OBS_NET_PORTS=443,8444 bash scripts/protect.sh)"
           F="$(printf '%s\n' "$OUT" | sed -n 's/.*Посмотреть: cat //p' | tail -1)"
-          grep -q 'meter syn4net_22 ' "$F" && grep -q 'meter obs4net ' "$F" \
-            || { echo "в $F нет метров /24"; exit 1; }
+          # с v4.2-rw1 /24-метры — наборы с timeout: `set NAME {… flags dynamic,timeout …}` + `update @NAME`
+          for s in syn4net_22 obs4net; do
+            grep -qE "set $s \{.*flags dynamic,timeout" "$F" && grep -q "update @$s " "$F" \
+              || { echo "в $F нет набора /24 $s с timeout"; exit 1; }
+          done
+          ! grep -qE 'meter (syn4net_22|obs4net) ' "$F" || { echo "в $F остался meter /24 без timeout"; exit 1; }
       - name: protect.sh — отказ на кривом ENV (валидация)
         run: |
           if SYN_RATE='x; rm' DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh 2>/dev/null; then

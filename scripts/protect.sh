@@ -1373,13 +1373,19 @@ if [[ "$ENABLE_SCANNERS" == "1" ]]; then
     # получить заглушку сайта, как любой клиент без ключа (REALITY/selfsteal), — тишина
     # на 443 при живом сайте для всех остальных и есть отпечаток прокси. Остальные
     # порты и не-TCP для них закрыты. (rw, 22.09.2026)
+    # Исключение — ICMP echo-request (rw, 07.10.2026): узел, который отвечает на пинг
+    # всем, кроме госсетей, выделяется тем же образом, что тишина на 443. Пинг из tspu_*
+    # проходит дальше по цепочке и режется тем же per-IP лимитом @icmp4/@icmp6, что у
+    # всех; прочие типы ICMP (и NDP v6) от них — drop.
     SCANNER_DROP="        # масс-сканеры (ASN-лист + префикс-фиды) — обновляет na-scanner-update
         ip  saddr @scanner_v4 drop
         ip6 saddr @scanner_v6 drop
-        # ТСПУ/госсети — на 80/443 идут в заглушку (маскировка), остальное drop
-        ip  saddr @tspu_v4 meta l4proto != tcp drop
+        # ТСПУ/госсети — на 80/443 идут в заглушку (маскировка), пинг — под общий лимит ICMP, остальное drop
+        ip  saddr @tspu_v4 meta l4proto != { tcp, icmp } drop
+        ip  saddr @tspu_v4 icmp type != echo-request drop
         ip  saddr @tspu_v4 tcp dport != { 80, 443 } drop
-        ip6 saddr @tspu_v6 meta l4proto != tcp drop
+        ip6 saddr @tspu_v6 meta l4proto != { tcp, ipv6-icmp } drop
+        ip6 saddr @tspu_v6 icmpv6 type != echo-request drop
         ip6 saddr @tspu_v6 tcp dport != { 80, 443 } drop"
 fi
 
@@ -2337,7 +2343,8 @@ WHOIS_TIMEOUT="${WHOIS_TIMEOUT:-20}"
 # NA_SET=tspu — тот же конвейер (три предохранителя, дырки под свои адреса,
 # last-known-good, кэш на ребут) для второго набора: инфраструктура ТСПУ/госсети
 # из custom-tspu.txt (пишет na-rkn-update). Без ASN и без сканер-фидов. Правило в
-# na_filter для tspu_* — drop всего, кроме tcp 80/443 (зонд цензора видит заглушку).
+# na_filter для tspu_* — drop всего, кроме tcp 80/443 (зонд цензора видит заглушку)
+# и ICMP echo-request (под общим лимитом @icmp4/@icmp6, как у всех).
 SETN=scanner; CACHE=scanner-cache.nft
 if [ "${NA_SET:-scanner}" = tspu ]; then
     SETN=tspu; TAG=na-tspu; CACHE=scanner-cache-tspu.nft

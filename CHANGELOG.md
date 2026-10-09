@@ -1,5 +1,15 @@
 # Changelog
 
+## v4.2-rw2 — 2026-10-09 (форк drobyazkome)
+
+- **Пинг из `tspu_v4`/`tspu_v6` — под общим лимитером.** Правило «не-TCP — drop» для
+  адресов ТСПУ заменено парой: `meta l4proto != { tcp, icmp } drop` и
+  `icmp type != echo-request drop` (v6 — `ipv6-icmp`/`icmpv6`). Echo-request от ТСПУ
+  идёт дальше по цепочке к тем же `update @icmp4/@icmp6 … drop` и `accept`, что у
+  всех; прочие типы ICMP и NDP от ТСПУ режутся, TCP — только 80/443, как было.
+  Узел, который молчит на пинг только для адресов ТСПУ, выделяется сам. Тест —
+  `tests/protect-unit.sh`, раздел 10.
+
 ## v4.2-rw1 — 2026-10-04 (форк drobyazkome)
 
 Слит апстрим v4.1.3 и v4.2. Наш слой — сканеры и ТСПУ (`ENABLE_SCANNERS`, `tspu_v4`),

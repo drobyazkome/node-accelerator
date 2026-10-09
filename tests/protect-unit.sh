@@ -22,6 +22,8 @@
 #   9. SSH_NET_RATE и OBS_NET_PORTS (29.09.2026): /24-метры syn4net_22 и obs4net
 #      генерирует шаблон — на своих местах в цепочке, с именами, по которым их сверяет
 #      vpn; без ручек — как в апстриме; мусор — отказ; ре-ран без ENV их не снимает.
+#  10. ICMP из tspu_* (07.10.2026): echo-request из сетей ТСПУ не режется у входа, а идёт
+#      к общему per-IP лимиту @icmp4/@icmp6; прочие типы ICMP и не-TCP от них — drop.
 #
 # Не требует root/сети/nft/systemd. Запуск: bash tests/protect-unit.sh
 # Проверить на старой версии:  NA_PROTECT_SH=<путь> bash tests/protect-unit.sh  (упадёт)
@@ -536,6 +538,53 @@ if [[ -f "$f" ]]; then
     rm -f "$f"
 else
     checkf "ре-ран с пустым OBS_NET_PORTS не дал файла"
+fi
+
+# ─── 10. ICMP из tspu_*: пинг под общим лимитом, прочее — drop ──────────────
+# Решение владельца vpn 07.10.2026: узел, отвечающий на пинг всем, кроме госсетей,
+# выделяется так же, как тишина на 443. Правило — в генераторе, иначе ре-ран protect
+# снимет живую вставку. Генерация — gen из раздела 7, порядок — номера строк файла.
+echo "== 10. tspu_*: ICMP echo-request — под общий лимит @icmp4/@icmp6 =="
+f=$(gen ENABLE_SCANNERS=1 | head -1)
+if [[ ! -f "$f" ]]; then
+    checkf "DRY_RUN с ENABLE_SCANNERS=1 не дал файла: $(gen ENABLE_SCANNERS=1 | tail -2)"
+else
+    has() { grep -cF -- "$1" "$f"; }
+    check "v4: не-TCP и не-ICMP из tspu_v4 — drop" 1 "$(has 'ip  saddr @tspu_v4 meta l4proto != { tcp, icmp } drop')"
+    check "v4: ICMP из tspu_v4, кроме echo-request, — drop" 1 "$(has 'ip  saddr @tspu_v4 icmp type != echo-request drop')"
+    check "v4: TCP из tspu_v4 вне 80/443 — drop" 1 "$(has 'ip  saddr @tspu_v4 tcp dport != { 80, 443 } drop')"
+    check "v6: не-TCP и не-ICMPv6 из tspu_v6 — drop" 1 "$(has 'ip6 saddr @tspu_v6 meta l4proto != { tcp, ipv6-icmp } drop')"
+    check "v6: ICMPv6 из tspu_v6, кроме echo-request (и NDP), — drop" 1 "$(has 'ip6 saddr @tspu_v6 icmpv6 type != echo-request drop')"
+    check "v6: TCP из tspu_v6 вне 80/443 — drop" 1 "$(has 'ip6 saddr @tspu_v6 tcp dport != { 80, 443 } drop')"
+    check "прежней формы «всё не-TCP — drop» нет" 0 "$(grep -cE 'saddr @tspu_v[46] meta l4proto != tcp drop' "$f")"
+    check "правил с @tspu_v4 и @tspu_v6 — по три (vpn node-facts считает tspu_rules)" "3 3" \
+          "$(grep -c '@tspu_v4' "$f") $(grep -c '@tspu_v6' "$f")"
+    # echo-request из tspu доходит до общего лимитера: между правилами tspu и лимитером
+    # нет ни accept для ICMP, ни другого вердикта по ICMP; лимитер стоит перед accept
+    # правила своего семейства: v4 — icmp без icmpv6/ipv6-icmp, v6 — только они
+    for fam in 4 6; do
+        if [[ $fam == 4 ]]; then
+            t=$(line 'saddr @tspu_v4 icmp type != echo-request drop' "$f")
+            m=$(line 'echo-request update @icmp4 ' "$f"); a=$(line 'icmp type echo-request accept' "$f")
+            pat='(^|[^-])icmp($|[^v])'
+        else
+            t=$(line 'saddr @tspu_v6 icmpv6 type != echo-request drop' "$f")
+            m=$(line 'echo-request update @icmp6 ' "$f"); a=$(line 'icmpv6 type echo-request accept' "$f")
+            pat='icmpv6|ipv6-icmp'
+        fi
+        check "v$fam: tspu → лимитер @icmp$fam → accept — в этом порядке" 1 \
+              "$(( ${t:-0} > 0 && ${t:-0} < ${m:-0} && ${m:-0} < ${a:-0} ))"
+        check "v$fam: между tspu и лимитером ICMP никто не принимает и не режет" 0 \
+              "$(sed -n "$(( ${t:-1} + 1 )),$(( ${m:-1} - 1 ))p" "$f" | grep -v '@tspu_v' | grep -cE "$pat")"
+    done
+    rm -f "$f"
+fi
+f=$(gen | head -1)
+if [[ -f "$f" ]]; then
+    check "без ENABLE_SCANNERS — ни наборов, ни правил tspu" 0 "$(grep -c 'tspu_v' "$f")"
+    rm -f "$f"
+else
+    checkf "DRY_RUN без ENABLE_SCANNERS не дал файла"
 fi
 
 # ─── 6. v4.2: CROWDSEC_SCOPE — блок-листы только на SSH ───────────────────────

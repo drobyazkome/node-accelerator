@@ -1403,7 +1403,10 @@ fi
 # (у части хостеров он в 172.31/100.64), 169.254/16 не трогаем (metadata), 0/8 и
 # 240/4 тоже (DHCP). Только при известных WAN и шлюзе — иначе правил нет.
 OUTPUT_RULES=""
-GW="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')"
+# awk дочитывает вход до конца (без exit): маршрутов по умолчанию бывает два (timeweb:
+# наш с initcwnd и DHCP рядом), ip пишет их разными write, и ранний выход awk давал ip
+# SIGPIPE — pipefail отдавал 141, set -e обрывал protect до применения (v4.2-rw4).
+GW="$(ip -4 route show default 2>/dev/null | awk '!g { for (i = 1; i < NF; i++) if ($i == "via") { print $(i+1); g = 1; break } }')"
 if [[ -n "$WAN" && -n "$GW" ]]; then
     _PRIV='10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 127.0.0.0/8, 192.0.2.0/24, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24'
     OUTPUT_RULES="        # na-output-hygiene: узел не почтовик; приватные адресаты через WAN — только спуф/утечка
@@ -2367,7 +2370,7 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # ── protected: то, что нельзя дропнуть ни при каких фидах ────────────────────
 {
     ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}'
-    ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}'
+    ip -4 route show default 2>/dev/null | awk '!g { for (i = 1; i < NF; i++) if ($i == "via") { print $(i+1); g = 1; break } }'
     # элементы сета печатаются многострочно и по несколько в строке; берём всё, что
     # похоже на IPv4, начиная со строки elements =. Сет может отсутствовать — не ошибка.
     for s in whitelist_v4 na_fleet_v4 na_nodeport_wl_v4; do

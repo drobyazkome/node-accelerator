@@ -6,7 +6,7 @@
 # Версия тулкита — ЕДИНСТВЕННЫЙ источник. Пишется в installed-маркеры и отдаётся
 # в na-diagnose/na-report --json, чтобы флот-мониторинг видел version-drift по нодам.
 # shellcheck disable=SC2034
-NA_VERSION="4.2-rw3"
+NA_VERSION="4.2-rw4"
 
 # Числа — только с десятичной ТОЧКОЙ, сообщения утилит — на C. На ноде с LANG/LC_ALL=
 # de_DE.UTF-8 mawk читал «0.35» из /proc/loadavg как 0 (в JSON уезжал "load1":0), printf
@@ -281,7 +281,9 @@ ssh_conn_env() {
     if [[ -n "${SSH_CONNECTION:-}" ]]; then printf '%s' "$SSH_CONNECTION"; return 0; fi
     while [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 && "$n" -lt 16 ]]; do
         if [[ -r "/proc/$pid/environ" ]]; then
-            v="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^SSH_CONNECTION=//p' | head -n1)"
+            # первая строка — awk NR==1, а не head: head выходит раньше писателя, под
+            # set -e/pipefail это SIGPIPE и 141 (tests/lint-pipefail.sh)
+            v="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^SSH_CONNECTION=//p' | awk 'NR==1')"
             [[ -n "$v" ]] && { printf '%s' "$v"; return 0; }
         fi
         pid="$(awk '/^PPid:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)"
@@ -379,7 +381,7 @@ detect_node_port() {
             for c in $cands; do
                 d="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$c" 2>/dev/null || true)"
                 [[ -n "$d" && -f "$d/.env" ]] || continue
-                p="$(sed -nE 's/^[[:space:]]*(NODE_PORT|APP_PORT)=[^0-9]*([0-9]+).*/\2/p' "$d/.env" 2>/dev/null | head -1)"
+                p="$(sed -nE 's/^[[:space:]]*(NODE_PORT|APP_PORT)=[^0-9]*([0-9]+).*/\2/p' "$d/.env" 2>/dev/null | awk 'NR==1')"
                 _np_add "${p:-}"
             done
         fi
@@ -387,7 +389,7 @@ detect_node_port() {
     if [[ -z "$out" ]]; then
         f="${NA_REMNANODE_ENV:-/opt/remnanode/.env}"
         if [[ -f "$f" ]]; then
-            p="$(sed -nE 's/^[[:space:]]*(NODE_PORT|APP_PORT)=[^0-9]*([0-9]+).*/\2/p' "$f" 2>/dev/null | head -1)"
+            p="$(sed -nE 's/^[[:space:]]*(NODE_PORT|APP_PORT)=[^0-9]*([0-9]+).*/\2/p' "$f" 2>/dev/null | awk 'NR==1')"
             _np_add "${p:-}"
         fi
     fi

@@ -26,6 +26,8 @@
 #      к общему per-IP лимиту @icmp4/@icmp6; прочие типы ICMP и не-TCP от них — drop.
 #  11. счётчики фидов (18.10.2026): c_scanner и c_tspu — правила без вердикта прямо перед
 #      scanner_v4 drop; якорь scanner_v6 drop и блок ТСПУ за ним не сдвинуты.
+#  12. два маршрута по умолчанию (18.10.2026): выбор шлюза для priv-out дочитывает вывод
+#      ip до конца — ранний выход awk давал SIGPIPE, и protect падал с кодом 141.
 #
 # Не требует root/сети/nft/systemd. Запуск: bash tests/protect-unit.sh
 # Проверить на старой версии:  NA_PROTECT_SH=<путь> bash tests/protect-unit.sh  (упадёт)
@@ -621,6 +623,35 @@ if [[ -f "$f" ]]; then
     rm -f "$f"
 else
     checkf "DRY_RUN без ENABLE_SCANNERS не дал файла"
+fi
+
+# ─── 12. два маршрута по умолчанию: SIGPIPE в выборе шлюза ──────────────────
+# vpn 18.10.2026: на timeweb маршрутов по умолчанию два (наш с initcwnd 30 и DHCP), и
+# `ip route show default | awk '…{print; exit}'` под set -e/pipefail ронял protect
+# с кодом 141 в 26 и 12 из 2000 прогонов: awk выходил после первого маршрута, ip писал
+# второй в закрытый пайп. Стаб пишет маршруты двумя write с паузой между ними — старая
+# версия падает на каждом прогоне. Вывод gen — в переменную, а не `| head`: падение
+# здесь печатает хвост лога вторым write.
+echo "== 12. два маршрута по умолчанию: шлюз без SIGPIPE (rc=141) =="
+mkdir -p "$T/ip2"
+cat > "$T/ip2/ip" <<'IP'
+#!/bin/sh
+if [ "$*" = "-4 route show default" ]; then
+    printf 'default via 192.0.2.1 dev eth0 proto static initcwnd 30\n'
+    /bin/sleep 0.3
+    printf 'default via 192.0.2.254 dev eth0 proto dhcp src 192.0.2.10 metric 100\n'
+fi
+exit 0
+IP
+chmod +x "$T/ip2/ip"
+out=$(gen PATH="$T/ip2:$A/bin:$PATH")
+f=${out%%$'\n'*}
+if [[ ! -f "$f" ]]; then
+    checkf "DRY_RUN с двумя маршрутами по умолчанию не дал файла: $(printf '%s\n' "$out" | tail -2 | tr '\n' ' ')"
+else
+    check "priv-out исключает первый шлюз (лог и drop)" 2 "$(grep -cF 'ip daddr != 192.0.2.1 ip daddr {' "$f")"
+    check "второй шлюз в правила не попал" 0 "$(grep -cF '192.0.2.254' "$f")"
+    rm -f "$f"
 fi
 
 # ─── 6. v4.2: CROWDSEC_SCOPE — блок-листы только на SSH ───────────────────────

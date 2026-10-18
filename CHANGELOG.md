@@ -1,5 +1,18 @@
 # Changelog
 
+## v4.2-rw3 — 2026-10-18 (форк drobyazkome)
+
+- **Счётчики фидов `c_scanner` и `c_tspu`.** Сколько отбрасывают наборы-фиды, было не
+  видно: у `ip saddr @scanner_v4 drop` и правил `@tspu_v4` счётчиков нет. Перед
+  `ip saddr @scanner_v4 drop` встали четыре правила без вердикта:
+  `ip saddr @scanner_v4 counter name c_scanner` (и v6) и
+  `ip saddr @tspu_v4 ip saddr != @scanner_v4 counter name c_tspu` (и v6). Сами
+  drop-правила, якорь `ip6 saddr @scanner_v6 drop` и блок ТСПУ сразу за ним не
+  тронуты — по их тексту vpn сверяет разделение фидов. `c_scanner` — отброшенное
+  наборами `scanner_*`; `c_tspu` — всё от `tspu_*`, дошедшее до блока ТСПУ, вместе с
+  SYN на 80/443 и пингом, ушедшим к общему лимиту. Видны в `na-fw-status`. Тест —
+  `tests/protect-unit.sh`, раздел 11.
+
 ## v4.2-rw2 — 2026-10-09 (форк drobyazkome)
 
 - **Пинг из `tspu_v4`/`tspu_v6` — под общим лимитером.** Правило «не-TCP — drop» для

@@ -1377,7 +1377,15 @@ if [[ "$ENABLE_SCANNERS" == "1" ]]; then
     # всем, кроме госсетей, выделяется тем же образом, что тишина на 443. Пинг из tspu_*
     # проходит дальше по цепочке и режется тем же per-IP лимитом @icmp4/@icmp6, что у
     # всех; прочие типы ICMP (и NDP v6) от них — drop.
+    # Счётчики фидов (rw, 18.10.2026): отдельные правила без вердикта перед drop — сами
+    # правила drop не меняются, по их тексту vpn сверяет разделение фидов. c_scanner —
+    # отброшенное наборами scanner_*; c_tspu — всё от tspu_* мимо scanner_*, дошедшее до
+    # блока ТСПУ (и отброшенное, и SYN на 80/443, и пинг, ушедший к общему лимиту).
     SCANNER_DROP="        # масс-сканеры (ASN-лист + префикс-фиды) — обновляет na-scanner-update
+        ip  saddr @scanner_v4 counter name c_scanner
+        ip6 saddr @scanner_v6 counter name c_scanner
+        ip  saddr @tspu_v4 ip  saddr != @scanner_v4 counter name c_tspu
+        ip6 saddr @tspu_v6 ip6 saddr != @scanner_v6 counter name c_tspu
         ip  saddr @scanner_v4 drop
         ip6 saddr @scanner_v6 drop
         # ТСПУ/госсети — на 80/443 идут в заглушку (маскировка), пинг — под общий лимит ICMP, остальное drop
@@ -1575,7 +1583,7 @@ fi
 # (лог под rate-limit, на насыщении он молчит). Читает na-fw-status / na-diagnose.
 COUNTERS=""
 for _c in c_synflood c_udpflood c_udp_amp c_portscan c_autoban c_blocklist c_bogon c_badflags \
-          c_nodeport c_catchall c_dnat_guard c_sshflood; do
+          c_nodeport c_catchall c_dnat_guard c_sshflood c_scanner c_tspu; do
     COUNTERS+="    counter $_c { packets 0 bytes 0 }"$'\n'
 done
 unset _c

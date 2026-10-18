@@ -24,6 +24,8 @@
 #      vpn; без ручек — как в апстриме; мусор — отказ; ре-ран без ENV их не снимает.
 #  10. ICMP из tspu_* (07.10.2026): echo-request из сетей ТСПУ не режется у входа, а идёт
 #      к общему per-IP лимиту @icmp4/@icmp6; прочие типы ICMP и не-TCP от них — drop.
+#  11. счётчики фидов (18.10.2026): c_scanner и c_tspu — правила без вердикта прямо перед
+#      scanner_v4 drop; якорь scanner_v6 drop и блок ТСПУ за ним не сдвинуты.
 #
 # Не требует root/сети/nft/systemd. Запуск: bash tests/protect-unit.sh
 # Проверить на старой версии:  NA_PROTECT_SH=<путь> bash tests/protect-unit.sh  (упадёт)
@@ -557,8 +559,8 @@ else
     check "v6: ICMPv6 из tspu_v6, кроме echo-request (и NDP), — drop" 1 "$(has 'ip6 saddr @tspu_v6 icmpv6 type != echo-request drop')"
     check "v6: TCP из tspu_v6 вне 80/443 — drop" 1 "$(has 'ip6 saddr @tspu_v6 tcp dport != { 80, 443 } drop')"
     check "прежней формы «всё не-TCP — drop» нет" 0 "$(grep -cE 'saddr @tspu_v[46] meta l4proto != tcp drop' "$f")"
-    check "правил с @tspu_v4 и @tspu_v6 — по три (vpn node-facts считает tspu_rules)" "3 3" \
-          "$(grep -c '@tspu_v4' "$f") $(grep -c '@tspu_v6' "$f")"
+    check "правил drop с @tspu_v4 и @tspu_v6 — по три (vpn node-facts считает tspu_rules)" "3 3" \
+          "$(grep -c '@tspu_v4.* drop$' "$f") $(grep -c '@tspu_v6.* drop$' "$f")"
     # echo-request из tspu доходит до общего лимитера: между правилами tspu и лимитером
     # нет ни accept для ICMP, ни другого вердикта по ICMP; лимитер стоит перед accept
     # правила своего семейства: v4 — icmp без icmpv6/ipv6-icmp, v6 — только они
@@ -582,6 +584,40 @@ fi
 f=$(gen | head -1)
 if [[ -f "$f" ]]; then
     check "без ENABLE_SCANNERS — ни наборов, ни правил tspu" 0 "$(grep -c 'tspu_v' "$f")"
+    rm -f "$f"
+else
+    checkf "DRY_RUN без ENABLE_SCANNERS не дал файла"
+fi
+
+# ─── 11. счётчики фидов c_scanner и c_tspu ──────────────────────────────────
+# vpn 18.10.2026 (аудит портов и РКН, п. 7): сколько режут наборы-фиды, было не видно.
+# Счётчики — отдельные правила без вердикта прямо перед `ip saddr @scanner_v4 drop`:
+# drop-правила остаются как были, якорь `ip6 saddr @scanner_v6 drop` — один, блок ТСПУ —
+# сразу за ним (по этому vpn tspu-split-rollout.sh сверяет разделение фидов).
+echo "== 11. счётчики фидов c_scanner / c_tspu =="
+f=$(gen ENABLE_SCANNERS=1 | head -1)
+if [[ ! -f "$f" ]]; then
+    checkf "DRY_RUN с ENABLE_SCANNERS=1 не дал файла: $(gen ENABLE_SCANNERS=1 | tail -2)"
+else
+    has() { grep -cF -- "$1" "$f"; }
+    check "объявлены counter c_scanner и c_tspu" "1 1" \
+          "$(has 'counter c_scanner { packets 0 bytes 0 }') $(has 'counter c_tspu { packets 0 bytes 0 }')"
+    check "четыре правила-счётчика без вердикта" "1 1 1 1" \
+          "$(has 'ip  saddr @scanner_v4 counter name c_scanner') $(has 'ip6 saddr @scanner_v6 counter name c_scanner') $(has 'ip  saddr @tspu_v4 ip  saddr != @scanner_v4 counter name c_tspu') $(has 'ip6 saddr @tspu_v6 ip6 saddr != @scanner_v6 counter name c_tspu')"
+    check "у правил-счётчиков вердикта нет" 0 "$(grep -E 'counter name c_(scanner|tspu)' "$f" | grep -cE ' (drop|accept|jump|goto|return)')"
+    c1=$(line 'ip  saddr @scanner_v4 counter name c_scanner' "$f")
+    c4=$(line 'ip6 saddr @tspu_v6 ip6 saddr != @scanner_v6 counter name c_tspu' "$f")
+    d4=$(line '^ *ip  saddr @scanner_v4 drop$' "$f")
+    a6=$(line '^ *ip6 saddr @scanner_v6 drop$' "$f")
+    t1=$(line 'ip  saddr @tspu_v4 meta l4proto' "$f")
+    check "счётчики подряд, сразу перед scanner_v4 drop; якорь и блок ТСПУ — как были" 1 \
+          "$(( ${c1:-0} > 0 && ${c4:-0} == ${c1:-0} + 3 && ${d4:-0} == ${c4:-0} + 1 && ${a6:-0} == ${d4:-0} + 1 && ${t1:-0} == ${a6:-0} + 2 ))"
+    check "якорь ip6 saddr @scanner_v6 drop — один" 1 "$(grep -cE '^ *ip6 saddr @scanner_v6 drop$' "$f")"
+    rm -f "$f"
+fi
+f=$(gen | head -1)
+if [[ -f "$f" ]]; then
+    check "без ENABLE_SCANNERS — правил-счётчиков фидов нет" 0 "$(grep -cE 'counter name c_(scanner|tspu)' "$f")"
     rm -f "$f"
 else
     checkf "DRY_RUN без ENABLE_SCANNERS не дал файла"

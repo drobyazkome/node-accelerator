@@ -140,7 +140,7 @@ for st in ps4 psc4 icmp4 udp4_443; do
 done
 grep -q 'chain ssh_flood {' "$NFTF" || { echo "[x] strict: нет цепочки ssh_flood"; fail=1; }
 # ── v4.2 ──
-for c in c_synflood c_udpflood c_udp_amp c_portscan c_autoban c_blocklist c_bogon c_badflags c_nodeport c_catchall c_dnat_guard c_sshflood; do
+for c in c_synflood c_udpflood c_udp_amp c_portscan c_autoban c_blocklist c_bogon c_badflags c_nodeport c_catchall c_dnat_guard c_sshflood c_scanner c_tspu; do
     grep -q "counter $c { packets 0 bytes 0 }" "$NFTF" || { echo "[x] v4.2: не объявлен счётчик $c"; fail=1; }
 done
 grep -q 'ct status dnat ct state new jump dnat_guard' "$NFTF" || { echo "[x] v4.2: forward не ведёт новые DNAT-соединения в dnat_guard"; fail=1; }

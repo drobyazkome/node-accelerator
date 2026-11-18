@@ -128,7 +128,11 @@ xanmod_import_key() {
     tmpkey="$(mktemp)" || return 1
     if ! curl -fsSL --connect-timeout 5 --max-time 20 https://dl.xanmod.org/archive.key -o "$tmpkey"; then
         warn "dl.xanmod.org недоступен (обычно CF-403 на хостингах) — пробую Ubuntu keyserver…"
-        if ! curl -fsSL --connect-timeout 5 --max-time 20 \
+        # keyserver — единственный путь там, где XanMod отвечает 403 (раннеры GitHub,
+        # Hetzner, GCP), а сам он изредка не принимает соединение за 5 с: одна попытка
+        # роняла smoke 18.11. --retry повторяет таймаут соединения и 5xx; 403 XanMod
+        # выше не повторяем — он постоянный.
+        if ! curl -fsSL --connect-timeout 10 --max-time 20 --retry 3 --retry-delay 3 \
                 "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${XANMOD_FP: -16}" -o "$tmpkey"; then
             warn "Ключ XanMod недоступен ни напрямую, ни с keyserver"; rm -f "$tmpkey"; return 1
         fi
